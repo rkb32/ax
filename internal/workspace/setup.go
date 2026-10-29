@@ -33,6 +33,9 @@ const (
 	DefaultAXDir = "/ax"
 	// InitializedMarkerFilename is the base name of the marker file written after a successful maiden run.
 	InitializedMarkerFilename = "initialized"
+	// markerDirName is the directory under each workspace path that holds its marker. It sits on the
+	// workspace volume, so the marker survives a volumes-only resume.
+	markerDirName = ".ax"
 
 	defaultWorkspacePath = "/workspace"
 	defaultBranch        = "main"
@@ -60,8 +63,8 @@ type SetupResult struct {
 }
 
 // SetupWorkspace prepares the workspace directory on its maiden run: it clones the
-// declared Git repositories and creates the skills path. A marker file under AXDir
-// records a completed maiden run so subsequent calls are no-ops.
+// declared Git repositories and creates the skills path. A marker file under
+// <targetPath>/.ax records a completed maiden run so subsequent calls are no-ops.
 //
 // Git failures are logged and recorded under AXDir but do not abort setup. The marker
 // is withheld in that case so the next start retries the clone.
@@ -82,7 +85,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		slog.Warn("creating ax state directory", "dir", AXDir, "error", err)
 	}
 
-	markerPath := filepath.Join(AXDir, MarkerName(targetPath))
+	markerPath := filepath.Join(targetPath, markerDirName, InitializedMarkerFilename)
 	if _, err := os.Stat(markerPath); err == nil {
 		slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
 		return res, nil
@@ -250,20 +253,6 @@ func setupSkills(skills *v1alpha1.SkillsConfig) string {
 	return skills.Path
 }
 
-// MarkerName returns the maiden-run marker file name for a workspace mounted at
-// path. The name is derived from the path so a workspace mounted somewhere
-// other than the default tracks its setup independently.
-func MarkerName(path string) string {
-	if path == "" {
-		path = defaultWorkspacePath
-	}
-	clean := strings.Trim(filepath.Clean(path), "/")
-	if clean == "" {
-		clean = "root"
-	}
-	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
-}
-
 // writeMarker records a completed maiden run.
 func writeMarker(path string, ws *v1alpha1.Workspace) {
 	name := "unknown"
@@ -271,6 +260,9 @@ func writeMarker(path string, ws *v1alpha1.Workspace) {
 		name = ws.GetMetadata().GetName()
 	}
 	content := fmt.Sprintf("workspace: %s\ninitialized_at: %s\n", name, time.Now().UTC().Format(time.RFC3339))
+	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+		slog.Warn("failed to create marker directory", "path", path, "error", err)
+	}
 	if err := os.WriteFile(path, []byte(content), filePerm); err != nil {
 		slog.Warn("failed to write initialized marker file", "path", path, "error", err)
 	}
