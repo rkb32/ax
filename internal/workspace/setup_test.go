@@ -58,18 +58,18 @@ func TestSetupWorkspace_MaidenRun(t *testing.T) {
 		t.Errorf("expected maiden run to be true")
 	}
 
-	// Verify marker file exists under stateDir/initialized
-	markerFile := filepath.Join(stateDir, workspace.MarkerName(tempDir))
+	// Verify marker file exists under the workspace's .ax directory, not stateDir
+	markerFile := filepath.Join(tempDir, ".ax", workspace.InitializedMarkerFilename)
 	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
 		t.Errorf("expected marker file %s to exist", markerFile)
 	}
+	if _, err := os.Stat(filepath.Join(stateDir, workspace.InitializedMarkerFilename)); !os.IsNotExist(err) {
+		t.Errorf("expected marker NOT to be written under stateDir")
+	}
 
-	// Verify workspace directory has no .ax-initialized or .ax directory
+	// Verify workspace directory has no .ax-initialized file
 	if _, err := os.Stat(filepath.Join(tempDir, ".ax-initialized")); !os.IsNotExist(err) {
 		t.Errorf("expected .ax-initialized not to be in workspace")
-	}
-	if _, err := os.Stat(filepath.Join(tempDir, ".ax")); !os.IsNotExist(err) {
-		t.Errorf("expected .ax directory not to be in workspace")
 	}
 
 	// 2. Second run (should detect already initialized)
@@ -79,6 +79,58 @@ func TestSetupWorkspace_MaidenRun(t *testing.T) {
 	}
 	if res2.IsMaidenRun {
 		t.Errorf("expected maiden run to be false on second run")
+	}
+}
+
+// TestSetupWorkspace_MarkerSurvivesStateLoss simulates a volumes-only resume: the
+// workspace volume comes back but the AX state directory does not. Setup must not
+// run again, because the marker lives with the workspace.
+func TestSetupWorkspace_MarkerSurvivesStateLoss(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-resume-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "resume-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Files: []*v1alpha1.File{{Path: "AGENTS.md", Content: "first boot"}},
+		},
+	}
+
+	origAXDir := workspace.AXDir
+	defer func() { workspace.AXDir = origAXDir }()
+
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-before")
+	res1, err := workspace.SetupWorkspace(context.Background(), ws, tempDir)
+	if err != nil {
+		t.Fatalf("maiden setup failed: %v", err)
+	}
+	if !res1.IsMaidenRun {
+		t.Fatalf("expected maiden run on first boot")
+	}
+
+	// The agent edits its file, then the container restarts on a fresh state directory.
+	agentFile := filepath.Join(tempDir, "AGENTS.md")
+	if err := os.WriteFile(agentFile, []byte("edited by agent"), 0o644); err != nil {
+		t.Fatalf("failed to edit file: %v", err)
+	}
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-after")
+
+	res2, err := workspace.SetupWorkspace(context.Background(), ws, tempDir)
+	if err != nil {
+		t.Fatalf("resume setup failed: %v", err)
+	}
+	if res2.IsMaidenRun {
+		t.Errorf("expected no maiden run after resume when only the workspace survives")
+	}
+	got, err := os.ReadFile(agentFile)
+	if err != nil {
+		t.Fatalf("failed to read file after resume: %v", err)
+	}
+	if string(got) != "edited by agent" {
+		t.Errorf("resume overwrote agent edit: got %q", got)
 	}
 }
 
@@ -193,7 +245,7 @@ func TestSetupWorkspace_GitError(t *testing.T) {
 	}
 
 	// Verify initialization marker was not created due to failure
-	markerFile := filepath.Join(stateDir, workspace.MarkerName(tempDir))
+	markerFile := filepath.Join(tempDir, ".ax", workspace.InitializedMarkerFilename)
 	if _, err := os.Stat(markerFile); !os.IsNotExist(err) {
 		t.Errorf("expected marker file %s NOT to exist after failure", markerFile)
 	}
@@ -264,24 +316,6 @@ echo '3' > file.txt && git add . && git commit -m 'commit 3'
 	}
 	if got := string(out); got != "1\n" && got != "1" {
 		t.Errorf("expected 1 commit with depth=1, got %q", got)
-	}
-}
-
-func TestMarkerName(t *testing.T) {
-	tests := map[string]string{
-		"/workspace":        "initialized-workspace",
-		"/workspace/":       "initialized-workspace",
-		"":                  "initialized-workspace",
-		"/":                 "initialized-root",
-		"/workspace/tools":  "initialized-workspace-tools",
-		"/workspace/a/b":    "initialized-workspace-a-b",
-		"/srv/data":         "initialized-srv-data",
-		"/workspace/tools/": "initialized-workspace-tools",
-	}
-	for path, want := range tests {
-		if got := workspace.MarkerName(path); got != want {
-			t.Errorf("MarkerName(%q) = %q, want %q", path, got, want)
-		}
 	}
 }
 
