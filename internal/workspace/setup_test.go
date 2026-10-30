@@ -525,3 +525,46 @@ func TestSetupWorkspace_MarkerInsideWorktree(t *testing.T) {
 		t.Errorf("expected no maiden run after git clean -fdx in a worktree")
 	}
 }
+
+// TestSetupWorkspace_ReservedAxDirFilesSkipped checks that an inlined file aimed at
+// the AX marker directory is not written, so it cannot replace the marker.
+func TestSetupWorkspace_ReservedAxDirFilesSkipped(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-reserved-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-reserved")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "reserved-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Files: []*v1alpha1.File{{Path: ".ax/initialized", Content: "user content"}},
+		},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, tempDir)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if !res.IsMaidenRun {
+		t.Fatalf("expected maiden run on first setup")
+	}
+	data, err := os.ReadFile(filepath.Join(tempDir, ".ax", workspace.InitializedMarkerFilename))
+	if err != nil {
+		t.Fatalf("expected marker to exist: %v", err)
+	}
+	if strings.Contains(string(data), "user content") {
+		t.Errorf("inlined file overwrote the marker")
+	}
+
+	res2, err := workspace.SetupWorkspace(context.Background(), ws, tempDir)
+	if err != nil {
+		t.Fatalf("second setup failed: %v", err)
+	}
+	if res2.IsMaidenRun {
+		t.Errorf("expected no maiden run on second setup")
+	}
+}

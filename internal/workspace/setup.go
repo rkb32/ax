@@ -350,6 +350,16 @@ func RepoDirName(repoURL string) string {
 	return trimmed[idx+1:]
 }
 
+// isReservedPath reports whether dest falls inside the AX marker directory of the
+// workspace at targetPath. Inlined files must not replace AX's own state.
+func isReservedPath(targetPath, dest string) bool {
+	rel, err := filepath.Rel(targetPath, dest)
+	if err != nil {
+		return false
+	}
+	return rel == markerDirName || strings.HasPrefix(rel, markerDirName+string(filepath.Separator))
+}
+
 // writeFiles writes inlined files into the workspace directory.
 func writeFiles(files []*v1alpha1.File, targetPath string) {
 	for _, f := range files {
@@ -361,6 +371,10 @@ func writeFiles(files []*v1alpha1.File, targetPath string) {
 			dest = f.GetPath()
 		} else {
 			dest = filepath.Join(targetPath, f.GetPath())
+		}
+		if isReservedPath(targetPath, dest) {
+			slog.Warn("skipping workspace file in AX-reserved directory", "path", f.GetPath())
+			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(dest), dirPerm); err != nil {
 			slog.Warn("failed to create directory for workspace file", "path", dest, "error", err)
