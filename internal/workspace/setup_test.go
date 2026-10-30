@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -363,5 +364,46 @@ func TestSetupWorkspace_InlinedFiles(t *testing.T) {
 	}
 	if string(notesData) != "Hello AX" {
 		t.Errorf("unexpected content in notes.txt: %s", string(notesData))
+	}
+}
+
+// TestSetupWorkspace_ExcludesMarkerFromGitRepo checks that a workspace that is
+// itself a Git repo ignores the marker directory locally, so it is not committed.
+func TestSetupWorkspace_ExcludesMarkerFromGitRepo(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-exclude-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	initCmd := exec.Command("git", "init", "-q", tempDir)
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init failed: %v (%s)", err, string(out))
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "..", "ax-state-exclude")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "exclude-ws"}}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, tempDir); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(tempDir, ".git", "info", "exclude"))
+	if err != nil {
+		t.Fatalf("failed to read exclude file: %v", err)
+	}
+	if !strings.Contains(string(data), ".ax/\n") {
+		t.Errorf("expected .ax/ in exclude file, got %q", data)
+	}
+
+	// Running again must not add the entry twice.
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, tempDir); err != nil {
+		t.Fatalf("second setup failed: %v", err)
+	}
+	data, _ = os.ReadFile(filepath.Join(tempDir, ".git", "info", "exclude"))
+	if n := strings.Count(string(data), ".ax/"); n != 1 {
+		t.Errorf("expected one .ax/ entry, got %d", n)
 	}
 }

@@ -107,8 +107,40 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	}
 
 	writeMarker(markerPath, ws)
+	excludeMarkerDir(targetPath)
 	slog.Info("maiden run workspace setup completed successfully", "path", targetPath)
 	return res, nil
+}
+
+// excludeMarkerDir keeps the marker directory out of a workspace that is itself a
+// Git repository, so `git add -A` does not commit it. It writes to the repo's local
+// exclude file and leaves the repo's committed .gitignore alone.
+func excludeMarkerDir(targetPath string) {
+	gitDir := filepath.Join(targetPath, ".git")
+	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
+		return
+	}
+	excludePath := filepath.Join(gitDir, "info", "exclude")
+	if err := os.MkdirAll(filepath.Dir(excludePath), dirPerm); err != nil {
+		slog.Warn("creating git info directory", "path", excludePath, "error", err)
+		return
+	}
+	entry := markerDirName + "/"
+	existing, _ := os.ReadFile(excludePath)
+	for _, line := range strings.Split(string(existing), "\n") {
+		if strings.TrimSpace(line) == entry {
+			return
+		}
+	}
+	f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, filePerm)
+	if err != nil {
+		slog.Warn("opening git exclude file", "path", excludePath, "error", err)
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString(entry + "\n"); err != nil {
+		slog.Warn("writing git exclude file", "path", excludePath, "error", err)
+	}
 }
 
 // cloneRepos fetches each declared repository into the workspace. It returns the
