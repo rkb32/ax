@@ -750,3 +750,33 @@ func TestSetupWorkspace_AbsoluteFilePath(t *testing.T) {
 		t.Errorf("absolute path outside the workspace was written")
 	}
 }
+
+// TestSetupWorkspace_RefusesSymlinkedRoot checks that a workspace folder that is itself
+// a symbolic link is refused.
+func TestSetupWorkspace_RefusesSymlinkedRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir, err := os.MkdirTemp("", "ax-ws-root-link-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	real := filepath.Join(tempDir, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(tempDir, "ws")
+	if err := os.Symlink(real, root); err != nil {
+		t.Fatal(err)
+	}
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-root")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "root-link-ws"}}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, root); err == nil {
+		t.Errorf("expected a symlinked workspace root to be refused")
+	}
+}

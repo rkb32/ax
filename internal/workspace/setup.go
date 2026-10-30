@@ -81,6 +81,10 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	if err := os.MkdirAll(targetPath, dirPerm); err != nil {
 		return nil, fmt.Errorf("creating workspace directory %s: %w", targetPath, err)
 	}
+	// Only the workspace folder itself is checked. Its parents may be mount symlinks.
+	if err := refuseSymlink(targetPath); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(AXDir, dirPerm); err != nil {
 		slog.Warn("creating ax state directory", "dir", AXDir, "error", err)
 	}
