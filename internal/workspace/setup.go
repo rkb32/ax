@@ -107,7 +107,9 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		return res, nil
 	}
 
-	writeMarker(markerWritePath(targetPath), ws)
+	if err := writeMarker(markerWritePath(targetPath), ws); err != nil {
+		return nil, err
+	}
 	slog.Info("maiden run workspace setup completed successfully", "path", targetPath)
 	return res, nil
 }
@@ -133,6 +135,9 @@ func gitDirOf(targetPath string) string {
 		return ""
 	}
 	dir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+	if dir == "" {
+		return ""
+	}
 	if !filepath.IsAbs(dir) {
 		dir = filepath.Join(targetPath, dir)
 	}
@@ -316,18 +321,33 @@ func setupSkills(skills *v1alpha1.SkillsConfig) string {
 }
 
 // writeMarker records a completed maiden run.
-func writeMarker(path string, ws *v1alpha1.Workspace) {
+func writeMarker(path string, ws *v1alpha1.Workspace) error {
 	name := "unknown"
 	if ws != nil && ws.GetMetadata() != nil && ws.GetMetadata().GetName() != "" {
 		name = ws.GetMetadata().GetName()
 	}
 	content := fmt.Sprintf("workspace: %s\ninitialized_at: %s\n", name, time.Now().UTC().Format(time.RFC3339))
-	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
-		slog.Warn("failed to create marker directory", "path", path, "error", err)
+	dir := filepath.Dir(path)
+	if err := refuseSymlink(dir); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, dirPerm); err != nil {
+		return fmt.Errorf("creating marker directory %s: %w", dir, err)
 	}
 	if err := os.WriteFile(path, []byte(content), filePerm); err != nil {
-		slog.Warn("failed to write initialized marker file", "path", path, "error", err)
+		return fmt.Errorf("writing marker file %s: %w", path, err)
 	}
+	return nil
+}
+
+// refuseSymlink fails when dir exists and is a symbolic link, so a committed .ax link
+// cannot send the marker to a path outside the workspace.
+func refuseSymlink(dir string) error {
+	info, err := os.Lstat(dir)
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("marker directory %s is a symbolic link", dir)
+	}
+	return nil
 }
 
 // writeStateFile writes a diagnostic file under AXDir, logging rather than failing on error.
@@ -353,11 +373,17 @@ func RepoDirName(repoURL string) string {
 // isReservedPath reports whether dest falls inside the AX marker directory of the
 // workspace at targetPath. Inlined files must not replace AX's own state.
 func isReservedPath(targetPath, dest string) bool {
-	rel, err := filepath.Rel(targetPath, dest)
-	if err != nil {
-		return false
+	if rel, err := filepath.Rel(targetPath, dest); err == nil {
+		lower := strings.ToLower(filepath.ToSlash(rel))
+		if lower == ".git" || strings.HasPrefix(lower, ".git/") || lower == markerDirName || strings.HasPrefix(lower, markerDirName+"/") ||
+			lower == ".git/"+markerDirName || strings.HasPrefix(lower, ".git/"+markerDirName+"/") {
+			return true
+		}
 	}
-	return rel == markerDirName || strings.HasPrefix(rel, markerDirName+string(filepath.Separator))
+	if rel, err := filepath.Rel(AXDir, dest); err == nil && !strings.HasPrefix(rel, "..") {
+		return strings.HasPrefix(strings.ToLower(rel), strings.ToLower(InitializedMarkerFilename))
+	}
+	return false
 }
 
 // writeFiles writes inlined files into the workspace directory.
