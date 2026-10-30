@@ -19,7 +19,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -367,43 +366,53 @@ func TestSetupWorkspace_InlinedFiles(t *testing.T) {
 	}
 }
 
-// TestSetupWorkspace_ExcludesMarkerFromGitRepo checks that a workspace that is
-// itself a Git repo ignores the marker directory locally, so it is not committed.
-func TestSetupWorkspace_ExcludesMarkerFromGitRepo(t *testing.T) {
-	tempDir, err := os.MkdirTemp("", "ax-ws-exclude-*")
+// TestSetupWorkspace_MarkerInsideGitRepo checks that a workspace that is a Git repo
+// keeps its marker inside .git, so `git clean -fdx` cannot remove it.
+func TestSetupWorkspace_MarkerInsideGitRepo(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-gitmarker-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(tempDir)
 
-	initCmd := exec.Command("git", "init", "-q", tempDir)
-	if out, err := initCmd.CombinedOutput(); err != nil {
-		t.Fatalf("git init failed: %v (%s)", err, string(out))
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "test@ax.io"}, {"config", "user.name", "AX"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tempDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
 	}
 
 	origAXDir := workspace.AXDir
-	workspace.AXDir = filepath.Join(tempDir, "..", "ax-state-exclude")
+	workspace.AXDir = filepath.Join(tempDir, "..", "ax-state-gitmarker")
 	defer func() { workspace.AXDir = origAXDir }()
 
-	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "exclude-ws"}}
-	if _, err := workspace.SetupWorkspace(context.Background(), ws, tempDir); err != nil {
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "gitmarker-ws"}}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, tempDir)
+	if err != nil {
 		t.Fatalf("setup failed: %v", err)
 	}
+	if !res.IsMaidenRun {
+		t.Fatalf("expected maiden run on first setup")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, ".git", ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		t.Fatalf("expected marker inside .git: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, ".ax")); !os.IsNotExist(err) {
+		t.Errorf("expected no .ax directory in the worktree")
+	}
 
-	data, err := os.ReadFile(filepath.Join(tempDir, ".git", "info", "exclude"))
+	cleanCmd := exec.Command("git", "clean", "-fdx")
+	cleanCmd.Dir = tempDir
+	if out, err := cleanCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clean failed: %v (%s)", err, string(out))
+	}
+
+	res2, err := workspace.SetupWorkspace(context.Background(), ws, tempDir)
 	if err != nil {
-		t.Fatalf("failed to read exclude file: %v", err)
-	}
-	if !strings.Contains(string(data), ".ax/\n") {
-		t.Errorf("expected .ax/ in exclude file, got %q", data)
-	}
-
-	// Running again must not add the entry twice.
-	if _, err := workspace.SetupWorkspace(context.Background(), ws, tempDir); err != nil {
 		t.Fatalf("second setup failed: %v", err)
 	}
-	data, _ = os.ReadFile(filepath.Join(tempDir, ".git", "info", "exclude"))
-	if n := strings.Count(string(data), ".ax/"); n != 1 {
-		t.Errorf("expected one .ax/ entry, got %d", n)
+	if res2.IsMaidenRun {
+		t.Errorf("expected no maiden run after git clean -fdx")
 	}
 }

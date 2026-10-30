@@ -85,10 +85,11 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		slog.Warn("creating ax state directory", "dir", AXDir, "error", err)
 	}
 
-	markerPath := filepath.Join(targetPath, markerDirName, InitializedMarkerFilename)
-	if _, err := os.Stat(markerPath); err == nil {
-		slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
-		return res, nil
+	for _, candidate := range markerCandidates(targetPath) {
+		if _, err := os.Stat(candidate); err == nil {
+			slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
+			return res, nil
+		}
 	}
 
 	slog.Info("executing workspace maiden run setup", "path", targetPath)
@@ -106,41 +107,27 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		return res, nil
 	}
 
-	writeMarker(markerPath, ws)
-	excludeMarkerDir(targetPath)
+	writeMarker(markerWritePath(targetPath), ws)
 	slog.Info("maiden run workspace setup completed successfully", "path", targetPath)
 	return res, nil
 }
 
-// excludeMarkerDir keeps the marker directory out of a workspace that is itself a
-// Git repository, so `git add -A` does not commit it. It writes to the repo's local
-// exclude file and leaves the repo's committed .gitignore alone.
-func excludeMarkerDir(targetPath string) {
-	gitDir := filepath.Join(targetPath, ".git")
-	if info, err := os.Stat(gitDir); err != nil || !info.IsDir() {
-		return
+// markerCandidates lists where a maiden-run marker may already exist for a workspace.
+func markerCandidates(targetPath string) []string {
+	return []string{
+		filepath.Join(targetPath, ".git", markerDirName, InitializedMarkerFilename),
+		filepath.Join(targetPath, markerDirName, InitializedMarkerFilename),
 	}
-	excludePath := filepath.Join(gitDir, "info", "exclude")
-	if err := os.MkdirAll(filepath.Dir(excludePath), dirPerm); err != nil {
-		slog.Warn("creating git info directory", "path", excludePath, "error", err)
-		return
+}
+
+// markerWritePath picks where to record a completed maiden run. A workspace that is a
+// Git repo keeps the marker inside .git, which `git add -A` and `git clean -fdx` never
+// touch. Other workspaces keep it in a .ax directory.
+func markerWritePath(targetPath string) string {
+	if info, err := os.Stat(filepath.Join(targetPath, ".git")); err == nil && info.IsDir() {
+		return markerCandidates(targetPath)[0]
 	}
-	entry := markerDirName + "/"
-	existing, _ := os.ReadFile(excludePath)
-	for _, line := range strings.Split(string(existing), "\n") {
-		if strings.TrimSpace(line) == entry {
-			return
-		}
-	}
-	f, err := os.OpenFile(excludePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, filePerm)
-	if err != nil {
-		slog.Warn("opening git exclude file", "path", excludePath, "error", err)
-		return
-	}
-	defer f.Close()
-	if _, err := f.WriteString(entry + "\n"); err != nil {
-		slog.Warn("writing git exclude file", "path", excludePath, "error", err)
-	}
+	return markerCandidates(targetPath)[1]
 }
 
 // cloneRepos fetches each declared repository into the workspace. It returns the
