@@ -86,14 +86,23 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	}
 
 	for _, candidate := range markerCandidates(targetPath) {
-		if _, err := os.Stat(candidate); err == nil {
+		_, err := os.Stat(candidate)
+		if err == nil {
 			slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
 			return res, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("checking marker %s: %w", candidate, err)
 		}
 	}
 	// A marker from before the workspace-volume change lives under AXDir, which a resume
 	// does not restore. Move it to the current location so the next boot does not rerun setup.
-	if _, err := os.Stat(filepath.Join(AXDir, legacyMarkerName(targetPath))); err == nil {
+	legacy := filepath.Join(AXDir, legacyMarkerName(targetPath))
+	_, legacyErr := os.Stat(legacy)
+	if legacyErr != nil && !os.IsNotExist(legacyErr) {
+		return nil, fmt.Errorf("checking legacy marker %s: %w", legacy, legacyErr)
+	}
+	if legacyErr == nil {
 		slog.Info("migrating legacy workspace marker", "path", targetPath)
 		if err := writeMarker(markerWritePath(targetPath), ws); err != nil {
 			return nil, err
@@ -106,8 +115,9 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 
 	gitOK := true
 	if ws != nil && ws.Spec != nil {
-		writeFiles(ws.Spec.Files, targetPath)
+		filesOK := writeFiles(ws.Spec.Files, targetPath)
 		res.ClonedRepos, gitOK = cloneRepos(ctx, ws.Spec.Git, targetPath)
+		gitOK = gitOK && filesOK
 		res.SkillsMounted = setupSkills(ws.Spec.Skills)
 	}
 
@@ -128,8 +138,8 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 // real directory.
 func gitDirOf(targetPath string) string {
 	gitPath := filepath.Join(targetPath, ".git")
-	info, err := os.Stat(gitPath)
-	if err != nil {
+	info, err := os.Lstat(gitPath)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 {
 		return ""
 	}
 	if info.IsDir() {
@@ -153,6 +163,9 @@ func gitDirOf(targetPath string) string {
 	// A Git directory outside the workspace is not on the durable volume, so the marker
 	// would be lost on a volumes-only resume. Fall back to .ax in the workspace.
 	if rel, err := filepath.Rel(targetPath, dir); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	if target, err := os.Stat(dir); err != nil || !target.IsDir() {
 		return ""
 	}
 	return dir
@@ -186,7 +199,9 @@ func legacyMarkerName(path string) string {
 	if clean == "" {
 		clean = "root"
 	}
-	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
+	// Replace path separators and drive colons so the name is valid on every platform.
+	// Linux paths contain neither, so their names are unchanged.
+	return InitializedMarkerFilename + "-" + strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(clean)
 }
 
 // cloneRepos fetches each declared repository into the workspace. It returns the
@@ -200,6 +215,17 @@ func cloneRepos(ctx context.Context, repos []*v1alpha1.GitRepo, targetPath strin
 		}
 
 		dest := cloneDestination(repo, targetPath)
+		if err := checkInsideWorkspace(targetPath, dest); err != nil {
+			slog.Warn("skipping git repo outside the workspace", "repo", repo.Repo, "dir", dest, "error", err)
+			ok = false
+			continue
+		}
+		// A retry after another repo failed must not run checkout -f over a repo that
+		// already has its contents, because that discards the agent's uncommitted edits.
+		if isCheckout(ctx, dest) {
+			cloned = append(cloned, repo.Repo)
+			continue
+		}
 		if err := os.MkdirAll(dest, dirPerm); err != nil {
 			slog.Warn("failed to create destination dir", "dir", dest, "error", err)
 		}
@@ -385,9 +411,13 @@ func RepoDirName(repoURL string) string {
 // workspace at targetPath. Inlined files must not replace AX's own state.
 func isReservedPath(targetPath, dest string) bool {
 	if rel, err := filepath.Rel(targetPath, dest); err == nil {
-		lower := strings.ToLower(filepath.ToSlash(rel))
-		if lower == ".git" || strings.HasPrefix(lower, ".git/") || lower == markerDirName || strings.HasPrefix(lower, markerDirName+"/") ||
-			lower == ".git/"+markerDirName || strings.HasPrefix(lower, ".git/"+markerDirName+"/") {
+		// Windows ignores trailing dots and spaces and accepts 8.3 short names (GIT~1),
+		// so normalize each segment before comparing.
+		parts := strings.Split(strings.ToLower(filepath.ToSlash(rel)), "/")
+		for i := range parts {
+			parts[i] = strings.TrimRight(parts[i], ". ")
+		}
+		if first := parts[0]; first == ".git" || first == markerDirName || strings.HasPrefix(first, "git~") {
 			return true
 		}
 	}
@@ -398,29 +428,79 @@ func isReservedPath(targetPath, dest string) bool {
 }
 
 // writeFiles writes inlined files into the workspace directory.
-func writeFiles(files []*v1alpha1.File, targetPath string) {
+// writeFiles writes inlined files into the workspace. A file that already exists is kept,
+// so a retried setup does not overwrite the agent's edits. It reports whether every file
+// that should be written was written.
+func writeFiles(files []*v1alpha1.File, targetPath string) bool {
+	ok := true
 	for _, f := range files {
 		if f == nil || f.GetPath() == "" {
 			continue
 		}
-		var dest string
-		if filepath.IsAbs(f.GetPath()) {
-			dest = f.GetPath()
-		} else {
-			dest = filepath.Join(targetPath, f.GetPath())
-		}
+		// filepath.Join keeps an absolute path inside the workspace.
+		dest := filepath.Join(targetPath, f.GetPath())
 		if isReservedPath(targetPath, dest) {
 			slog.Warn("skipping workspace file in AX-reserved directory", "path", f.GetPath())
 			continue
 		}
+		if err := checkInsideWorkspace(targetPath, dest); err != nil {
+			slog.Warn("skipping workspace file outside the workspace", "path", f.GetPath(), "error", err)
+			ok = false
+			continue
+		}
+		if _, err := os.Lstat(dest); err == nil {
+			slog.Info("keeping existing workspace file", "path", dest)
+			continue
+		}
 		if err := os.MkdirAll(filepath.Dir(dest), dirPerm); err != nil {
 			slog.Warn("failed to create directory for workspace file", "path", dest, "error", err)
+			ok = false
 			continue
 		}
 		if err := os.WriteFile(dest, []byte(f.GetContent()), filePerm); err != nil {
 			slog.Warn("failed to write workspace file", "path", dest, "error", err)
+			ok = false
 			continue
 		}
 		slog.Info("wrote inlined workspace file", "path", dest)
 	}
+	return ok
+}
+
+// checkInsideWorkspace fails when dest is outside targetPath, or when any existing part of
+// the path between targetPath and dest is a symbolic link.
+func checkInsideWorkspace(targetPath, dest string) error {
+	rel, err := filepath.Rel(targetPath, dest)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%s is outside %s", dest, targetPath)
+	}
+	if rel == "." {
+		return nil
+	}
+	current := targetPath
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symbolic link", current)
+		}
+	}
+	return nil
+}
+
+// isCheckout reports whether dir already holds a Git checkout with a commit at HEAD.
+func isCheckout(ctx context.Context, dir string) bool {
+	// Require a .git here, so a parent repository's HEAD does not count.
+	if _, err := os.Lstat(filepath.Join(dir, ".git")); err != nil {
+		return false
+	}
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "-q", "HEAD")
+	cmd.Dir = dir
+	return cmd.Run() == nil
 }

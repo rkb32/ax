@@ -422,9 +422,6 @@ func TestSetupWorkspace_MarkerInsideGitRepo(t *testing.T) {
 // TestSetupWorkspace_HonorsLegacyMarker checks that a workspace set up before the
 // marker moved still counts as initialized, so an upgrade does not re-run setup.
 func TestSetupWorkspace_HonorsLegacyMarker(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("legacy marker names contain a drive colon, which Windows does not allow")
-	}
 	tempDir, err := os.MkdirTemp("", "ax-ws-legacy-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -435,7 +432,7 @@ func TestSetupWorkspace_HonorsLegacyMarker(t *testing.T) {
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	legacy := "initialized-" + strings.ReplaceAll(strings.Trim(filepath.Clean(tempDir), "/"), "/", "-")
+	legacy := "initialized-" + strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(strings.Trim(filepath.Clean(tempDir), "/"))
 	if err := os.WriteFile(filepath.Join(stateDir, legacy), []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -556,5 +553,163 @@ func TestSetupWorkspace_ReservedAxDirFilesSkipped(t *testing.T) {
 	}
 	if res2.IsMaidenRun {
 		t.Errorf("expected no maiden run on second setup")
+	}
+}
+
+// TestSetupWorkspace_FailsOnMarkerStatError checks that a marker path that cannot be
+// checked (here .ax is a regular file) fails setup instead of rerunning it.
+func TestSetupWorkspace_FailsOnMarkerStatError(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-stat-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := os.WriteFile(filepath.Join(tempDir, ".ax"), []byte("not a dir"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-stat")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "stat-ws"}}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, tempDir); err == nil {
+		t.Errorf("expected an error when the marker path cannot be checked")
+	}
+}
+
+// TestSetupWorkspace_RetryKeepsAgentEdits checks that when one repo fails, the retry does
+// not re-checkout the repo that succeeded or rewrite inlined files the agent edited.
+func TestSetupWorkspace_RetryKeepsAgentEdits(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-retry-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	srcDir, err := os.MkdirTemp("", "ax-src-retry-*")
+	if err != nil {
+		t.Fatalf("failed to create src dir: %v", err)
+	}
+	defer os.RemoveAll(srcDir)
+	initCmd := exec.Command("sh", "-c", "git init -q -b main && git config user.email t@ax.io && git config user.name AX && echo base > tracked.txt && git add . && git commit -q -m init")
+	initCmd.Dir = srcDir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("failed to init src repo: %v (%s)", err, string(out))
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-retry")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	target := filepath.Join(tempDir, "ws")
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "retry-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Git: []*v1alpha1.GitRepo{
+				{Name: "good", Repo: srcDir, Dir: "good"},
+				{Name: "bad", Repo: filepath.Join(tempDir, "missing-repo"), Dir: "bad"},
+			},
+			Files: []*v1alpha1.File{{Path: "AGENTS.md", Content: "first"}},
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if _, err := workspace.SetupWorkspace(ctx, ws, target); err != nil {
+		t.Fatalf("first setup failed: %v", err)
+	}
+
+	// The agent edits a tracked file and an inlined file, then the setup runs again.
+	if err := os.WriteFile(filepath.Join(target, "good", "tracked.txt"), []byte("agent edit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "AGENTS.md"), []byte("agent edit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspace.SetupWorkspace(ctx, ws, target); err != nil {
+		t.Fatalf("retry setup failed: %v", err)
+	}
+
+	got, _ := os.ReadFile(filepath.Join(target, "good", "tracked.txt"))
+	if string(got) != "agent edit" {
+		t.Errorf("retry discarded the agent's edit to a tracked file: got %q", got)
+	}
+	agents, _ := os.ReadFile(filepath.Join(target, "AGENTS.md"))
+	if string(agents) != "agent edit" {
+		t.Errorf("retry overwrote the agent's inlined file: got %q", agents)
+	}
+}
+
+// TestSetupWorkspace_RejectsEscapingFile checks that an inlined path cannot write outside
+// the workspace, and that the failure withholds the marker.
+func TestSetupWorkspace_RejectsEscapingFile(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-escape-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-escape")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	target := filepath.Join(tempDir, "ws")
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "escape-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Files: []*v1alpha1.File{{Path: "../escape.txt", Content: "outside"}},
+		},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "escape.txt")); !os.IsNotExist(err) {
+		t.Errorf("inlined file was written outside the workspace")
+	}
+	if _, err := os.Stat(filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); !os.IsNotExist(err) {
+		t.Errorf("marker was written even though a file was rejected")
+	}
+}
+
+// TestSetupWorkspace_RejectsSymlinkedPath checks that an inlined file cannot be written
+// through a symbolic link that points outside the workspace.
+func TestSetupWorkspace_RejectsSymlinkedPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir, err := os.MkdirTemp("", "ax-ws-symlink-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	outside := filepath.Join(tempDir, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tempDir, "ws")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(target, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-symlink")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "symlink-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Files: []*v1alpha1.File{{Path: "link/hooks.sh", Content: "bad"}},
+		},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "hooks.sh")); !os.IsNotExist(err) {
+		t.Errorf("inlined file was written through a symbolic link outside the workspace")
 	}
 }
