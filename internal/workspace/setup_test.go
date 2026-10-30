@@ -461,3 +461,67 @@ func TestSetupWorkspace_HonorsLegacyMarker(t *testing.T) {
 		t.Errorf("expected spec files not to be rewritten on a legacy-initialized workspace")
 	}
 }
+
+// TestSetupWorkspace_MarkerInsideWorktree checks that a workspace that is a Git
+// worktree (.git is a file) keeps its marker in the worktree's Git directory, so
+// `git clean -fdx` cannot remove it.
+func TestSetupWorkspace_MarkerInsideWorktree(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-worktree-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mainDir := filepath.Join(tempDir, "main")
+	wtDir := filepath.Join(tempDir, "wt")
+	if err := os.MkdirAll(mainDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmds := [][]string{
+		{"init", "-q", "-b", "main"},
+		{"config", "user.email", "test@ax.io"},
+		{"config", "user.name", "AX"},
+		{"commit", "-q", "--allow-empty", "-m", "init"},
+		{"worktree", "add", "-q", wtDir},
+	}
+	for _, args := range cmds {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = mainDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v (%s)", args, err, string(out))
+		}
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-worktree")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "worktree-ws"}}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, wtDir)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if !res.IsMaidenRun {
+		t.Fatalf("expected maiden run on first setup")
+	}
+	if _, err := os.Stat(filepath.Join(mainDir, ".git", "worktrees", "wt", ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		t.Fatalf("expected marker in the worktree's Git directory: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(wtDir, ".ax")); !os.IsNotExist(err) {
+		t.Errorf("expected no .ax directory in the worktree")
+	}
+
+	cleanCmd := exec.Command("git", "clean", "-fdx")
+	cleanCmd.Dir = wtDir
+	if out, err := cleanCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clean failed: %v (%s)", err, string(out))
+	}
+
+	res2, err := workspace.SetupWorkspace(context.Background(), ws, wtDir)
+	if err != nil {
+		t.Fatalf("second setup failed: %v", err)
+	}
+	if res2.IsMaidenRun {
+		t.Errorf("expected no maiden run after git clean -fdx in a worktree")
+	}
+}

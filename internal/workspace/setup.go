@@ -112,15 +112,53 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	return res, nil
 }
 
+// gitDirOf returns the Git directory of a workspace root, or "" when the root is not a
+// Git repo. A worktree or submodule has a .git file whose "gitdir:" line points at the
+// real directory.
+func gitDirOf(targetPath string) string {
+	gitPath := filepath.Join(targetPath, ".git")
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		return ""
+	}
+	if info.IsDir() {
+		return gitPath
+	}
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return ""
+	}
+	line := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(line, "gitdir:") {
+		return ""
+	}
+	dir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(targetPath, dir)
+	}
+	return dir
+}
+
 // markerCandidates lists where a maiden-run marker may already exist for a workspace.
 func markerCandidates(targetPath string) []string {
-	return []string{
-		filepath.Join(targetPath, ".git", markerDirName, InitializedMarkerFilename),
-		filepath.Join(targetPath, markerDirName, InitializedMarkerFilename),
-		// Markers written before this change lived under AXDir. Honor them so an upgraded
-		// workspace does not re-run setup and discard uncommitted edits.
-		filepath.Join(AXDir, legacyMarkerName(targetPath)),
+	var candidates []string
+	if gitDir := gitDirOf(targetPath); gitDir != "" {
+		candidates = append(candidates, filepath.Join(gitDir, markerDirName, InitializedMarkerFilename))
 	}
+	candidates = append(candidates, filepath.Join(targetPath, markerDirName, InitializedMarkerFilename))
+	// Markers written before this change lived under AXDir. Honor them so an upgraded
+	// workspace does not re-run setup and discard uncommitted edits.
+	return append(candidates, filepath.Join(AXDir, legacyMarkerName(targetPath)))
+}
+
+// markerWritePath picks where to record a completed maiden run. A workspace that is a
+// Git repo, worktree, or submodule keeps the marker inside its Git directory, which
+// `git add -A` and `git clean -fdx` never touch. Other workspaces keep it in .ax.
+func markerWritePath(targetPath string) string {
+	if gitDir := gitDirOf(targetPath); gitDir != "" {
+		return filepath.Join(gitDir, markerDirName, InitializedMarkerFilename)
+	}
+	return filepath.Join(targetPath, markerDirName, InitializedMarkerFilename)
 }
 
 // legacyMarkerName is the marker file name used before markers moved into the workspace.
@@ -133,16 +171,6 @@ func legacyMarkerName(path string) string {
 		clean = "root"
 	}
 	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
-}
-
-// markerWritePath picks where to record a completed maiden run. A workspace that is a
-// Git repo keeps the marker inside .git, which `git add -A` and `git clean -fdx` never
-// touch. Other workspaces keep it in a .ax directory.
-func markerWritePath(targetPath string) string {
-	if info, err := os.Stat(filepath.Join(targetPath, ".git")); err == nil && info.IsDir() {
-		return markerCandidates(targetPath)[0]
-	}
-	return markerCandidates(targetPath)[1]
 }
 
 // cloneRepos fetches each declared repository into the workspace. It returns the
