@@ -91,6 +91,15 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 			return res, nil
 		}
 	}
+	// A marker from before the workspace-volume change lives under AXDir, which a resume
+	// does not restore. Move it to the current location so the next boot does not rerun setup.
+	if _, err := os.Stat(filepath.Join(AXDir, legacyMarkerName(targetPath))); err == nil {
+		slog.Info("migrating legacy workspace marker", "path", targetPath)
+		if err := writeMarker(markerWritePath(targetPath), ws); err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
 
 	slog.Info("executing workspace maiden run setup", "path", targetPath)
 	res.IsMaidenRun = true
@@ -141,6 +150,11 @@ func gitDirOf(targetPath string) string {
 	if !filepath.IsAbs(dir) {
 		dir = filepath.Join(targetPath, dir)
 	}
+	// A Git directory outside the workspace is not on the durable volume, so the marker
+	// would be lost on a volumes-only resume. Fall back to .ax in the workspace.
+	if rel, err := filepath.Rel(targetPath, dir); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
 	return dir
 }
 
@@ -150,10 +164,7 @@ func markerCandidates(targetPath string) []string {
 	if gitDir := gitDirOf(targetPath); gitDir != "" {
 		candidates = append(candidates, filepath.Join(gitDir, markerDirName, InitializedMarkerFilename))
 	}
-	candidates = append(candidates, filepath.Join(targetPath, markerDirName, InitializedMarkerFilename))
-	// Markers written before this change lived under AXDir. Honor them so an upgraded
-	// workspace does not re-run setup and discard uncommitted edits.
-	return append(candidates, filepath.Join(AXDir, legacyMarkerName(targetPath)))
+	return append(candidates, filepath.Join(targetPath, markerDirName, InitializedMarkerFilename))
 }
 
 // markerWritePath picks where to record a completed maiden run. A workspace that is a

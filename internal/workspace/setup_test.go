@@ -462,10 +462,9 @@ func TestSetupWorkspace_HonorsLegacyMarker(t *testing.T) {
 	}
 }
 
-// TestSetupWorkspace_MarkerInsideWorktree checks that a workspace that is a Git
-// worktree (.git is a file) keeps its marker in the worktree's Git directory, so
-// `git clean -fdx` cannot remove it.
-func TestSetupWorkspace_MarkerInsideWorktree(t *testing.T) {
+// TestSetupWorkspace_MarkerOnVolumeForWorktree checks that a linked worktree keeps its
+// marker in the workspace (the volume), because its Git directory is outside it.
+func TestSetupWorkspace_MarkerOnVolumeForWorktree(t *testing.T) {
 	tempDir, err := os.MkdirTemp("", "ax-ws-worktree-*")
 	if err != nil {
 		t.Fatalf("failed to create temp dir: %v", err)
@@ -504,17 +503,8 @@ func TestSetupWorkspace_MarkerInsideWorktree(t *testing.T) {
 	if !res.IsMaidenRun {
 		t.Fatalf("expected maiden run on first setup")
 	}
-	if _, err := os.Stat(filepath.Join(mainDir, ".git", "worktrees", "wt", ".ax", workspace.InitializedMarkerFilename)); err != nil {
-		t.Fatalf("expected marker in the worktree's Git directory: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(wtDir, ".ax")); !os.IsNotExist(err) {
-		t.Errorf("expected no .ax directory in the worktree")
-	}
-
-	cleanCmd := exec.Command("git", "clean", "-fdx")
-	cleanCmd.Dir = wtDir
-	if out, err := cleanCmd.CombinedOutput(); err != nil {
-		t.Fatalf("git clean failed: %v (%s)", err, string(out))
+	if _, err := os.Stat(filepath.Join(wtDir, ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		t.Fatalf("expected marker in the workspace volume: %v", err)
 	}
 
 	res2, err := workspace.SetupWorkspace(context.Background(), ws, wtDir)
@@ -522,7 +512,7 @@ func TestSetupWorkspace_MarkerInsideWorktree(t *testing.T) {
 		t.Fatalf("second setup failed: %v", err)
 	}
 	if res2.IsMaidenRun {
-		t.Errorf("expected no maiden run after git clean -fdx in a worktree")
+		t.Errorf("expected no maiden run on the next boot")
 	}
 }
 
