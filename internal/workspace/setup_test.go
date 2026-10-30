@@ -713,3 +713,40 @@ func TestSetupWorkspace_RejectsSymlinkedPath(t *testing.T) {
 		t.Errorf("inlined file was written through a symbolic link outside the workspace")
 	}
 }
+
+// TestSetupWorkspace_AbsoluteFilePath checks that an absolute inlined path is written at
+// that path when it is inside the workspace, and rejected when it is outside.
+func TestSetupWorkspace_AbsoluteFilePath(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "ax-ws-abs-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-abs")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	target := filepath.Join(tempDir, "ws")
+	inside := filepath.Join(target, "config", "inside.txt")
+	outside := filepath.Join(tempDir, "outside.txt")
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "abs-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Files: []*v1alpha1.File{
+				{Path: inside, Content: "inside"},
+				{Path: outside, Content: "outside"},
+			},
+		},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	got, err := os.ReadFile(inside)
+	if err != nil || string(got) != "inside" {
+		t.Errorf("absolute path inside the workspace was not written where requested: %v %q", err, got)
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Errorf("absolute path outside the workspace was written")
+	}
+}

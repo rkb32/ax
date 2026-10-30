@@ -437,8 +437,10 @@ func writeFiles(files []*v1alpha1.File, targetPath string) bool {
 		if f == nil || f.GetPath() == "" {
 			continue
 		}
-		// filepath.Join keeps an absolute path inside the workspace.
-		dest := filepath.Join(targetPath, f.GetPath())
+		dest := f.GetPath()
+		if !filepath.IsAbs(dest) {
+			dest = filepath.Join(targetPath, dest)
+		}
 		if isReservedPath(targetPath, dest) {
 			slog.Warn("skipping workspace file in AX-reserved directory", "path", f.GetPath())
 			continue
