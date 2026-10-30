@@ -19,6 +19,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -414,5 +416,48 @@ func TestSetupWorkspace_MarkerInsideGitRepo(t *testing.T) {
 	}
 	if res2.IsMaidenRun {
 		t.Errorf("expected no maiden run after git clean -fdx")
+	}
+}
+
+// TestSetupWorkspace_HonorsLegacyMarker checks that a workspace set up before the
+// marker moved still counts as initialized, so an upgrade does not re-run setup.
+func TestSetupWorkspace_HonorsLegacyMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("legacy marker names contain a drive colon, which Windows does not allow")
+	}
+	tempDir, err := os.MkdirTemp("", "ax-ws-legacy-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	stateDir := filepath.Join(tempDir, "ax-state")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := "initialized-" + strings.ReplaceAll(strings.Trim(filepath.Clean(tempDir), "/"), "/", "-")
+	if err := os.WriteFile(filepath.Join(stateDir, legacy), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = stateDir
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "legacy-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Files: []*v1alpha1.File{{Path: "AGENTS.md", Content: "from spec"}},
+		},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, tempDir)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if res.IsMaidenRun {
+		t.Errorf("expected no maiden run when a legacy marker exists")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "AGENTS.md")); !os.IsNotExist(err) {
+		t.Errorf("expected spec files not to be rewritten on a legacy-initialized workspace")
 	}
 }

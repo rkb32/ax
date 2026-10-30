@@ -117,7 +117,22 @@ func markerCandidates(targetPath string) []string {
 	return []string{
 		filepath.Join(targetPath, ".git", markerDirName, InitializedMarkerFilename),
 		filepath.Join(targetPath, markerDirName, InitializedMarkerFilename),
+		// Markers written before this change lived under AXDir. Honor them so an upgraded
+		// workspace does not re-run setup and discard uncommitted edits.
+		filepath.Join(AXDir, legacyMarkerName(targetPath)),
 	}
+}
+
+// legacyMarkerName is the marker file name used before markers moved into the workspace.
+func legacyMarkerName(path string) string {
+	if path == "" {
+		path = defaultWorkspacePath
+	}
+	clean := strings.Trim(filepath.Clean(path), "/")
+	if clean == "" {
+		clean = "root"
+	}
+	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
 }
 
 // markerWritePath picks where to record a completed maiden run. A workspace that is a
