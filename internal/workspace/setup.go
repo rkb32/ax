@@ -89,16 +89,18 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		slog.Warn("creating ax state directory", "dir", AXDir, "error", err)
 	}
 
-	for _, candidate := range markerCandidates(targetPath) {
+	for _, loc := range markerLocs(targetPath) {
+		// Every link on the way to the marker is refused, so a symlinked .ax or marker
+		// cannot send the check outside the workspace.
+		if err := checkInsideWorkspace(loc.base, loc.path); err != nil {
+			return nil, fmt.Errorf("checking marker %s: %w", loc.path, err)
+		}
 		// Lstat, not Stat: a dangling symlink at the marker path must not count as "absent".
-		if _, err := os.Lstat(candidate); err == nil {
-			if err := refuseSymlink(candidate); err != nil {
-				return nil, err
-			}
+		if _, err := os.Lstat(loc.path); err == nil {
 			slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
 			return res, nil
 		} else if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("checking marker %s: %w", candidate, err)
+			return nil, fmt.Errorf("checking marker %s: %w", loc.path, err)
 		}
 	}
 	// A marker from before the workspace-volume change lives under AXDir, which a resume
@@ -110,7 +112,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	}
 	if legacyErr == nil {
 		slog.Info("migrating legacy workspace marker", "path", targetPath)
-		if err := writeMarker(markerWritePath(targetPath), ws); err != nil {
+		if err := writeMarker(markerWriteLoc(targetPath), ws); err != nil {
 			return nil, err
 		}
 		return res, nil
@@ -132,7 +134,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		return res, nil
 	}
 
-	if err := writeMarker(markerWritePath(targetPath), ws); err != nil {
+	if err := writeMarker(markerWriteLoc(targetPath), ws); err != nil {
 		return nil, err
 	}
 	slog.Info("maiden run workspace setup completed successfully", "path", targetPath)
@@ -150,6 +152,10 @@ func gitDirOf(targetPath string) string {
 	}
 	if info.IsDir() {
 		return gitPath
+	}
+	// Only a regular file can hold a gitdir line. A FIFO or device would block the read.
+	if !info.Mode().IsRegular() {
+		return ""
 	}
 	data, err := os.ReadFile(gitPath)
 	if err != nil {
@@ -188,23 +194,24 @@ func gitDirOf(targetPath string) string {
 	return resolved
 }
 
-// markerCandidates lists where a maiden-run marker may already exist for a workspace.
-func markerCandidates(targetPath string) []string {
-	var candidates []string
+// markerLoc is a place a maiden-run marker can live. base is the directory the path is
+// under, so every component between base and path can be checked for symbolic links.
+type markerLoc struct{ base, path string }
+
+// markerLocs lists where a maiden-run marker may already exist for a workspace.
+func markerLocs(targetPath string) []markerLoc {
+	var locs []markerLoc
 	if gitDir := gitDirOf(targetPath); gitDir != "" {
-		candidates = append(candidates, filepath.Join(gitDir, markerDirName, InitializedMarkerFilename))
+		locs = append(locs, markerLoc{gitDir, filepath.Join(gitDir, markerDirName, InitializedMarkerFilename)})
 	}
-	return append(candidates, filepath.Join(targetPath, markerDirName, InitializedMarkerFilename))
+	return append(locs, markerLoc{targetPath, filepath.Join(targetPath, markerDirName, InitializedMarkerFilename)})
 }
 
-// markerWritePath picks where to record a completed maiden run. A workspace that is a
+// markerWriteLoc picks where to record a completed maiden run. A workspace that is a
 // Git repo, worktree, or submodule keeps the marker inside its Git directory, which
 // `git add -A` and `git clean -fdx` never touch. Other workspaces keep it in .ax.
-func markerWritePath(targetPath string) string {
-	if gitDir := gitDirOf(targetPath); gitDir != "" {
-		return filepath.Join(gitDir, markerDirName, InitializedMarkerFilename)
-	}
-	return filepath.Join(targetPath, markerDirName, InitializedMarkerFilename)
+func markerWriteLoc(targetPath string) markerLoc {
+	return markerLocs(targetPath)[0]
 }
 
 // legacyMarkerName is the marker file name used before markers moved into the workspace.
@@ -245,7 +252,14 @@ func cloneRepos(ctx context.Context, repos []*v1alpha1.GitRepo, targetPath strin
 		}
 		// A retry after another repo failed must not run checkout -f over a repo that
 		// already has its contents, because that discards the agent's uncommitted edits.
-		if isCheckout(ctx, dest) {
+		if has, matches := existingCheckout(ctx, dest, repo.Repo); has {
+			// A checkout of another repository is never counted as this one, and it is
+			// not overwritten either.
+			if !matches {
+				slog.Warn("destination holds a checkout of another repo; skipping", "repo", repo.Repo, "dir", dest)
+				ok = false
+				continue
+			}
 			cloned = append(cloned, repo.Repo)
 			continue
 		}
@@ -321,6 +335,17 @@ func fetchRepo(ctx context.Context, dir, repoURL, branch string, depth int32) ([
 		return nil
 	}
 
+	// Checking out over existing files would overwrite an agent's edits, so refuse when the
+	// directory holds anything besides a partial .git from an earlier run.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return combined, err
+	}
+	for _, e := range entries {
+		if e.Name() != ".git" {
+			return combined, fmt.Errorf("refusing to check out over existing files in %s", dir)
+		}
+	}
 	if err := run("init"); err != nil {
 		return combined, err
 	}
@@ -381,22 +406,21 @@ func setupSkills(skills *v1alpha1.SkillsConfig) string {
 }
 
 // writeMarker records a completed maiden run.
-func writeMarker(path string, ws *v1alpha1.Workspace) error {
+func writeMarker(loc markerLoc, ws *v1alpha1.Workspace) error {
+	path := loc.path
 	name := "unknown"
 	if ws != nil && ws.GetMetadata() != nil && ws.GetMetadata().GetName() != "" {
 		name = ws.GetMetadata().GetName()
 	}
 	content := fmt.Sprintf("workspace: %s\ninitialized_at: %s\n", name, time.Now().UTC().Format(time.RFC3339))
-	dir := filepath.Dir(path)
-	if err := refuseSymlink(dir); err != nil {
+	// Refuse any symbolic link between the base and the marker, including the file itself,
+	// because WriteFile would follow it.
+	if err := checkInsideWorkspace(loc.base, path); err != nil {
 		return err
 	}
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return fmt.Errorf("creating marker directory %s: %w", dir, err)
-	}
-	// WriteFile follows a symbolic link at path, so refuse one before writing.
-	if err := refuseSymlink(path); err != nil {
-		return err
 	}
 	if err := os.WriteFile(path, []byte(content), filePerm); err != nil {
 		return fmt.Errorf("writing marker file %s: %w", path, err)
@@ -529,13 +553,23 @@ func checkInsideWorkspace(targetPath, dest string) error {
 	return nil
 }
 
-// isCheckout reports whether dir already holds a Git checkout with a commit at HEAD.
-func isCheckout(ctx context.Context, dir string) bool {
+// existingCheckout reports whether dir already holds a Git checkout with a commit at HEAD
+// (has), and whether its origin is repoURL (matches).
+func existingCheckout(ctx context.Context, dir, repoURL string) (has, matches bool) {
 	// Require a .git here, so a parent repository's HEAD does not count.
 	if _, err := os.Lstat(filepath.Join(dir, ".git")); err != nil {
-		return false
+		return false, false
 	}
-	cmd := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "-q", "HEAD")
-	cmd.Dir = dir
-	return cmd.Run() == nil
+	head := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "-q", "HEAD")
+	head.Dir = dir
+	if head.Run() != nil {
+		return false, false
+	}
+	origin := exec.CommandContext(ctx, "git", "config", "--get", "remote.origin.url")
+	origin.Dir = dir
+	out, err := origin.Output()
+	if err != nil {
+		return true, false
+	}
+	return true, strings.TrimSpace(string(out)) == repoURL
 }

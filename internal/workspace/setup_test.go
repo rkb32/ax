@@ -883,3 +883,81 @@ func TestSetupWorkspace_DirectoryCollisionNotMarked(t *testing.T) {
 		t.Errorf("marker written although a declared file was not created")
 	}
 }
+
+// TestSetupWorkspace_RefusesSymlinkedMarkerDir checks that a .ax directory that is a link to
+// a directory outside the workspace, holding an initialized marker, is not trusted.
+func TestSetupWorkspace_RefusesSymlinkedMarkerDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir := t.TempDir()
+	outside := filepath.Join(tempDir, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(outside, workspace.InitializedMarkerFilename)
+	if err := os.WriteFile(marker, []byte("planted"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tempDir, "ws")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(target, ".ax")); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-dir-link")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "marker-dir-link-ws"}}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err == nil {
+		t.Errorf("expected a symlinked .ax directory to be refused")
+	}
+	if data, _ := os.ReadFile(marker); string(data) != "planted" {
+		t.Errorf("marker outside the workspace was modified")
+	}
+}
+
+// TestSetupWorkspace_ForeignCheckoutNotCounted checks that a destination already holding a
+// checkout of another repository is neither counted as the declared clone nor overwritten.
+func TestSetupWorkspace_ForeignCheckoutNotCounted(t *testing.T) {
+	tempDir := t.TempDir()
+	target := filepath.Join(tempDir, "ws")
+	dest := filepath.Join(target, "code")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dest, "-c", "user.name=t", "-c", "user.email=t@example.invalid"}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("commit", "-q", "--allow-empty", "-m", "foreign")
+	git("remote", "add", "origin", "https://example.invalid/foreign.git")
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-foreign")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "foreign-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Git: []*v1alpha1.GitRepo{{Name: "wanted", Repo: "https://example.invalid/wanted.git", Dir: "code"}},
+		},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); !os.IsNotExist(err) {
+		t.Errorf("marker written although the declared repo was not checked out")
+	}
+	out, _ := exec.Command("git", "-C", dest, "config", "--get", "remote.origin.url").Output()
+	if got := string(out); got != "https://example.invalid/foreign.git\n" {
+		t.Errorf("foreign checkout's origin changed to %q", got)
+	}
+}
