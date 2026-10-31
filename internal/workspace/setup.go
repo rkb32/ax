@@ -399,11 +399,25 @@ func removeIdenticalFiles(ctx context.Context, dir, ref string) error {
 			continue
 		}
 		fields := strings.Fields(meta)
-		if len(fields) != 3 || fields[1] != "blob" || fields[0] == "120000" {
+		if len(fields) != 3 || fields[1] != "blob" {
 			continue
 		}
 		p := filepath.Join(dir, filepath.FromSlash(path))
-		if checkInsideWorkspace(dir, p) != nil {
+		if checkInsideWorkspace(dir, filepath.Dir(p)) != nil {
+			continue
+		}
+		// A symlink left by an interrupted checkout is removed only when it points where the
+		// repo's link points, so the checkout can recreate it.
+		if fields[0] == "120000" {
+			same, err := identicalSymlink(ctx, dir, p, fields[2])
+			if err != nil {
+				return err
+			}
+			if same {
+				if err := os.Remove(p); err != nil {
+					return fmt.Errorf("removing %s: %w", p, err)
+				}
+			}
 			continue
 		}
 		info, err := os.Lstat(p)
@@ -738,4 +752,30 @@ func existingCheckoutBounded(ctx context.Context, dir, repoURL string) (has, mat
 	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
 	defer cancel()
 	return existingCheckout(ctx, dir, repoURL)
+}
+
+// identicalSymlink reports whether p is a symbolic link whose target equals the repo's link
+// target stored in blob. A missing path is not a match.
+func identicalSymlink(ctx context.Context, dir, p, blob string) (bool, error) {
+	info, err := os.Lstat(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	target, err := os.Readlink(p)
+	if err != nil {
+		return false, err
+	}
+	cmd := exec.CommandContext(ctx, "git", "cat-file", "blob", blob)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("reading link target %s: %w", blob, err)
+	}
+	return target == string(out), nil
 }

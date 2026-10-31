@@ -1518,3 +1518,48 @@ func TestSetupWorkspace_ResumesCRLFCheckout(t *testing.T) {
 		t.Errorf("CRLF checkout left by an interrupted run was not resumed: %v", res.ClonedRepos)
 	}
 }
+
+// TestSetupWorkspace_ResumesInterruptedSymlink checks that a symbolic link left by an
+// interrupted checkout, pointing where the repo's link points, does not block the next run.
+func TestSetupWorkspace_ResumesInterruptedSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mk := exec.Command("sh", "-c", "git init -q && git symbolic-ref HEAD refs/heads/main && git config user.email t@ax.io && git config user.name AX && printf 'hi\n' > README.md && ln -s README.md link && git add . && git commit -qm init")
+	mk.Dir = src
+	if out, err := mk.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+
+	target := filepath.Join(tempDir, "ws")
+	dest := filepath.Join(target, "code")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initCmd := exec.Command("sh", "-c", "git init -q && git remote add origin "+src+" && ln -s README.md link")
+	initCmd.Dir = dest
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init dest: %v (%s)", err, out)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-symlink-resume")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "symlink-resume-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "code", Repo: src, Dir: "code"}}},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if len(res.ClonedRepos) != 1 {
+		t.Errorf("interrupted symlink blocked the resume: %v", res.ClonedRepos)
+	}
+}
