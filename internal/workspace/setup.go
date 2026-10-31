@@ -45,6 +45,7 @@ const (
 	gitErrorLog   = "git-error.log"
 	gitRetries    = 5
 	gitRetryDelay = 2 * time.Second
+	gitTimeout    = 10 * time.Minute
 
 	dirPerm  = 0o755
 	filePerm = 0o644
@@ -118,9 +119,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	}
 	if legacyErr == nil {
 		slog.Info("migrating legacy workspace marker", "path", targetPath)
-		if err := writeMarker(markerWriteLoc(targetPath), ws); err != nil {
-			return nil, err
-		}
+		recordMarker(targetPath, ws)
 		return res, nil
 	}
 
@@ -140,9 +139,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		return res, nil
 	}
 
-	if err := writeMarker(markerWriteLoc(targetPath), ws); err != nil {
-		return nil, err
-	}
+	recordMarker(targetPath, ws)
 	slog.Info("maiden run workspace setup completed successfully", "path", targetPath)
 	return res, nil
 }
@@ -244,6 +241,13 @@ func cloneRepos(ctx context.Context, repos []*v1alpha1.GitRepo, targetPath strin
 			continue
 		}
 
+		// A value starting with "-" would be read by git as an option, such as
+		// --upload-pack, which runs a command. Refuse it.
+		if strings.HasPrefix(repo.Repo, "-") || strings.HasPrefix(repo.Branch, "-") {
+			slog.Warn("skipping git repo with an option-like repo or branch", "repo", repo.Repo, "branch", repo.Branch)
+			ok = false
+			continue
+		}
 		dest := cloneDestination(repo, targetPath)
 		// A clone must not land on AX's own state, such as the workspace's .git or .ax.
 		if isReservedPath(targetPath, dest) {
@@ -280,7 +284,10 @@ func cloneRepos(ctx context.Context, repos []*v1alpha1.GitRepo, targetPath strin
 
 		slog.Info("initializing and fetching git repo", "repo", repo.Repo, "branch", branch, "dir", dest, "depth", repo.Depth)
 		out, err := retry(ctx, gitRetries, gitRetryDelay, func() ([]byte, error) {
-			return fetchRepo(ctx, dest, repo.Repo, branch, repo.Depth)
+			// Bound each attempt, so a stalled remote cannot block the task from starting.
+			attemptCtx, cancel := context.WithTimeout(ctx, gitTimeout)
+			defer cancel()
+			return fetchRepo(attemptCtx, dest, repo.Repo, branch, repo.Depth)
 		})
 		if err != nil {
 			ok = false
@@ -341,17 +348,6 @@ func fetchRepo(ctx context.Context, dir, repoURL, branch string, depth int32) ([
 		return nil
 	}
 
-	// Checking out over existing files would overwrite an agent's edits, so refuse when the
-	// directory holds anything besides a partial .git from an earlier run.
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return combined, err
-	}
-	for _, e := range entries {
-		if e.Name() != ".git" {
-			return combined, fmt.Errorf("refusing to check out over existing files in %s", dir)
-		}
-	}
 	if err := run("init"); err != nil {
 		return combined, err
 	}
@@ -369,10 +365,33 @@ func fetchRepo(ctx context.Context, dir, repoURL, branch string, depth int32) ([
 	if err := run(fetchArgs...); err != nil {
 		return combined, err
 	}
-	if err := run("checkout", "-f", "FETCH_HEAD"); err != nil {
+	// No -f: git refuses to overwrite a tracked file with local edits, or an untracked file
+	// that the checkout would replace. An inlined file that is not in the repo is left alone.
+	if err := run("checkout", "FETCH_HEAD"); err != nil {
 		return combined, err
 	}
 	return combined, nil
+}
+
+// writeFileAtomic writes data to a temporary file beside path, then renames it into place,
+// so a failed or interrupted write never leaves a truncated file at path.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".ax-write-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), filePerm); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // retry runs op up to attempts times, waiting delay between failures. It stops early
@@ -409,6 +428,15 @@ func setupSkills(skills *v1alpha1.SkillsConfig) string {
 		slog.Warn("creating skills dir", "path", skills.Path, "error", err)
 	}
 	return skills.Path
+}
+
+// recordMarker writes the maiden-run marker. A failure is logged, not returned: setup
+// already succeeded, and returning an error would stop the task from ever becoming ready.
+// The next boot then reruns setup, which keeps existing files and checkouts.
+func recordMarker(targetPath string, ws *v1alpha1.Workspace) {
+	if err := writeMarker(markerWriteLoc(targetPath), ws); err != nil {
+		slog.Warn("could not record maiden-run marker; setup will rerun on the next boot", "path", targetPath, "error", err)
+	}
 }
 
 // writeMarker records a completed maiden run.
@@ -534,7 +562,7 @@ func writeFiles(files []*v1alpha1.File, targetPath string) bool {
 			ok = false
 			continue
 		}
-		if err := os.WriteFile(dest, []byte(f.GetContent()), filePerm); err != nil {
+		if err := writeFileAtomic(dest, []byte(f.GetContent())); err != nil {
 			slog.Warn("failed to write workspace file", "path", dest, "error", err)
 			ok = false
 			continue
@@ -547,6 +575,13 @@ func writeFiles(files []*v1alpha1.File, targetPath string) bool {
 // checkInsideWorkspace fails when dest is outside targetPath, or when any existing part of
 // the path between targetPath and dest is a symbolic link.
 func checkInsideWorkspace(targetPath, dest string) error {
+	// An absolute path with ".." is not cleaned before use, so the kernel would resolve it
+	// through any symbolic link on the way. Refuse it outright.
+	for _, part := range strings.Split(filepath.ToSlash(dest), "/") {
+		if part == ".." {
+			return fmt.Errorf("%s contains a parent directory reference", dest)
+		}
+	}
 	rel, err := filepath.Rel(targetPath, dest)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("%s is outside %s", dest, targetPath)
@@ -554,8 +589,9 @@ func checkInsideWorkspace(targetPath, dest string) error {
 	if rel == "." {
 		return nil
 	}
+	parts := strings.Split(rel, string(filepath.Separator))
 	current := targetPath
-	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+	for i, part := range parts {
 		current = filepath.Join(current, part)
 		info, err := os.Lstat(current)
 		if err != nil {
@@ -566,6 +602,11 @@ func checkInsideWorkspace(targetPath, dest string) error {
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%s is a symbolic link", current)
+		}
+		// A file where a parent directory belongs cannot hold anything below it. Windows
+		// reports that as "not found" rather than "not a directory", so check it here.
+		if !info.IsDir() && i < len(parts)-1 {
+			return fmt.Errorf("%s is not a directory", current)
 		}
 	}
 	return nil

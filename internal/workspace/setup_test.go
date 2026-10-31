@@ -991,3 +991,43 @@ func TestSetupWorkspace_RefusesSymlinkedAncestor(t *testing.T) {
 		t.Errorf("workspace was created through a symbolic link parent")
 	}
 }
+
+// TestSetupWorkspace_InlineFileBeforeRootClone checks that an inlined file in the workspace
+// root does not stop a clone of the same root.
+func TestSetupWorkspace_InlineFileBeforeRootClone(t *testing.T) {
+	tempDir := t.TempDir()
+	srcDir := filepath.Join(tempDir, "src")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initCmd := exec.Command("sh", "-c", "git init -q && git symbolic-ref HEAD refs/heads/main && git config user.email t@ax.io && git config user.name AX && echo hi > README.md && git add . && git commit -qm init")
+	initCmd.Dir = srcDir
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+
+	target := filepath.Join(tempDir, "ws")
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-inline-clone")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "inline-clone-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Files: []*v1alpha1.File{{Path: "a.txt", Content: "x"}},
+			Git:   []*v1alpha1.GitRepo{{Name: "root", Repo: srcDir, Dir: "."}},
+		},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if len(res.ClonedRepos) != 1 {
+		t.Errorf("root repo not cloned: %v", res.ClonedRepos)
+	}
+	if _, err := os.Stat(filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		if _, err2 := os.Stat(filepath.Join(target, ".git", ".ax", workspace.InitializedMarkerFilename)); err2 != nil {
+			t.Errorf("marker missing after a successful clone")
+		}
+	}
+}
