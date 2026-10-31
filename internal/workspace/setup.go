@@ -93,7 +93,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	// container that still has AXDir does not rerun setup over the agent's edits.
 	if _, err := os.Stat(filepath.Join(AXDir, MarkerName(targetPath))); err == nil {
 		slog.Info("migrating legacy workspace marker", "path", targetPath)
-		writeMarker(markerPath, ws)
+		writeMarker(workspaceMarkerPath(targetPath), ws)
 		return res, nil
 	}
 
@@ -112,7 +112,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		return res, nil
 	}
 
-	writeMarker(markerPath, ws)
+	writeMarker(workspaceMarkerPath(targetPath), ws)
 	slog.Info("maiden run workspace setup completed successfully", "path", targetPath)
 	return res, nil
 }

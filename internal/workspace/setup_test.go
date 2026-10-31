@@ -328,3 +328,51 @@ func TestSetupWorkspace_InlinedFiles(t *testing.T) {
 		t.Errorf("unexpected content in notes.txt: %s", string(notesData))
 	}
 }
+
+// TestSetupWorkspace_MarkerFollowsRootClone checks that when a repo is cloned into the
+// workspace root, the marker is written where the next run looks for it: inside the new
+// .git directory. The next run must then skip setup.
+func TestSetupWorkspace_MarkerFollowsRootClone(t *testing.T) {
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	initSourceRepo(t, src, "hi\n")
+
+	target := filepath.Join(tempDir, "ws")
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-root-clone")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "root-clone-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "root", Repo: src, Dir: "."}}},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("first setup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, ".git", ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		t.Fatalf("marker not in the cloned .git directory: %v", err)
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("second setup failed: %v", err)
+	}
+	if res.IsMaidenRun {
+		t.Errorf("second run reran setup; the marker was not found")
+	}
+}
+
+// initSourceRepo makes a git repo at dir with one committed file, README.md = content.
+func initSourceRepo(t *testing.T, dir, content string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", "git init -q && git symbolic-ref HEAD refs/heads/main && git config user.email t@ax.io && git config user.name AX && git add . && git commit -qm init")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+}
