@@ -426,7 +426,7 @@ pwd
 cat /workspace/primary/app.py
 cat /workspace/primary/overlay/config.yaml
 test -d /workspace/primary/.agents/skills && echo SKILLS_DIR_OK
-test -f /ax/initialized-workspace-primary && echo MARKERS_OK
+test -f /workspace/primary/.git/.ax/initialized && echo MARKERS_OK
 `)
 	assertContains(t, "workspace setup check", out,
 		"/workspace/primary",
