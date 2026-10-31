@@ -1367,3 +1367,106 @@ func TestSetupWorkspace_KeepsMatchingCheckout(t *testing.T) {
 		t.Errorf("local edit to a matching checkout was overwritten: %q", data)
 	}
 }
+
+// TestSetupWorkspace_BoundsExistingCheckoutProbe checks that a stalled git config read during
+// a retry is cut off by the per-attempt timeout, instead of holding setup forever.
+func TestSetupWorkspace_BoundsExistingCheckoutProbe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script as a stand-in for git")
+	}
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	initSourceRepo(t, src, "hi\n")
+
+	target := filepath.Join(tempDir, "ws")
+	dest := filepath.Join(target, "code")
+	if out, err := exec.Command("git", "clone", "-q", src, dest).CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v (%s)", err, out)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A git stand-in that stalls on config. exec replaces the shell, so the timeout kills it.
+	fakeDir := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = config ]; then exec sleep 30; fi\nexec " + realGit + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(fakeDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	defer workspace.SetGitTimeoutForTest(200 * time.Millisecond)()
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-probe")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "probe-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "code", Repo: src, Dir: "code"}}},
+	}
+	start := time.Now()
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	// Without the bound each probe would wait 30s, so the limit below separates the two.
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Errorf("setup took %v; a stalled config probe was not cut off", elapsed)
+	}
+	if len(res.ClonedRepos) != 0 {
+		t.Errorf("repo counted as cloned while its probe was stalled: %v", res.ClonedRepos)
+	}
+}
+
+// TestSetupWorkspace_KeepsExecBitEdit checks that a file whose bytes match the repo but whose
+// executable bit was changed locally is kept during a resumed checkout.
+func TestSetupWorkspace_KeepsExecBitEdit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file mode bits are not meaningful on Windows")
+	}
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	initSourceRepo(t, src, "hi\n")
+
+	target := filepath.Join(tempDir, "ws")
+	dest := filepath.Join(target, "code")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initCmd := exec.Command("sh", "-c", "git init -q && git remote add origin "+src)
+	initCmd.Dir = dest
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	file := filepath.Join(dest, "README.md")
+	if err := os.WriteFile(file, []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(file, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-exec")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "exec-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "code", Repo: src, Dir: "code"}}},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	info, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Errorf("executable-bit edit was discarded")
+	}
+	if len(res.ClonedRepos) != 0 {
+		t.Errorf("repo counted as cloned over a locally edited file: %v", res.ClonedRepos)
+	}
+}

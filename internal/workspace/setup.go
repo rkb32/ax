@@ -412,6 +412,11 @@ func removeIdenticalFiles(ctx context.Context, dir, ref string) error {
 		if err != nil || !info.Mode().IsRegular() {
 			continue
 		}
+		// The repo mode decides the executable bit. A file whose bit differs was changed locally,
+		// so it is kept even when its bytes match.
+		if (info.Mode().Perm()&0o111 != 0) != (fields[0] == "100755") {
+			continue
+		}
 		data, err := os.ReadFile(p)
 		if err != nil {
 			continue
