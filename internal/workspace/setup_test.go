@@ -824,3 +824,37 @@ func TestSetupWorkspace_MarkerNotThroughOutsideGitDirLink(t *testing.T) {
 		t.Errorf("marker missing from the workspace fallback: %v", err)
 	}
 }
+
+// TestSetupWorkspace_RefusesDanglingMarkerLink checks that a symbolic link at the marker
+// path, even one whose target does not exist, is refused rather than followed.
+func TestSetupWorkspace_RefusesDanglingMarkerLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir, err := os.MkdirTemp("", "ax-ws-dangling-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	outside := filepath.Join(tempDir, "outside-marker")
+	target := filepath.Join(tempDir, "ws")
+	if err := os.MkdirAll(filepath.Join(target, ".ax"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-dangling")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "dangling-ws"}}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err == nil {
+		t.Errorf("expected a symbolic link at the marker path to be refused")
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Errorf("marker was written through a dangling symbolic link")
+	}
+}

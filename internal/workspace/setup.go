@@ -90,12 +90,14 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	}
 
 	for _, candidate := range markerCandidates(targetPath) {
-		_, err := os.Stat(candidate)
-		if err == nil {
+		// Lstat, not Stat: a dangling symlink at the marker path must not count as "absent".
+		if _, err := os.Lstat(candidate); err == nil {
+			if err := refuseSymlink(candidate); err != nil {
+				return nil, err
+			}
 			slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
 			return res, nil
-		}
-		if !os.IsNotExist(err) {
+		} else if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("checking marker %s: %w", candidate, err)
 		}
 	}
@@ -230,6 +232,12 @@ func cloneRepos(ctx context.Context, repos []*v1alpha1.GitRepo, targetPath strin
 		}
 
 		dest := cloneDestination(repo, targetPath)
+		// A clone must not land on AX's own state, such as the workspace's .git or .ax.
+		if isReservedPath(targetPath, dest) {
+			slog.Warn("skipping git repo in AX-reserved directory", "repo", repo.Repo, "dir", dest)
+			ok = false
+			continue
+		}
 		if err := checkInsideWorkspace(targetPath, dest); err != nil {
 			slog.Warn("skipping git repo outside the workspace", "repo", repo.Repo, "dir", dest, "error", err)
 			ok = false
@@ -386,6 +394,10 @@ func writeMarker(path string, ws *v1alpha1.Workspace) error {
 	if err := os.MkdirAll(dir, dirPerm); err != nil {
 		return fmt.Errorf("creating marker directory %s: %w", dir, err)
 	}
+	// WriteFile follows a symbolic link at path, so refuse one before writing.
+	if err := refuseSymlink(path); err != nil {
+		return err
+	}
 	if err := os.WriteFile(path, []byte(content), filePerm); err != nil {
 		return fmt.Errorf("writing marker file %s: %w", path, err)
 	}
@@ -397,7 +409,7 @@ func writeMarker(path string, ws *v1alpha1.Workspace) error {
 func refuseSymlink(dir string) error {
 	info, err := os.Lstat(dir)
 	if err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("marker directory %s is a symbolic link", dir)
+		return fmt.Errorf("%s is a symbolic link", dir)
 	}
 	return nil
 }
@@ -432,7 +444,7 @@ func isReservedPath(targetPath, dest string) bool {
 		for i := range parts {
 			parts[i] = strings.TrimRight(parts[i], ". ")
 		}
-		if first := parts[0]; first == ".git" || first == markerDirName || strings.HasPrefix(first, "git~") {
+		if first := parts[0]; first == ".git" || first == markerDirName || strings.HasPrefix(first, "git~") || strings.HasPrefix(first, "ax~") {
 			return true
 		}
 	}
