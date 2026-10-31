@@ -16,6 +16,8 @@ package workspace
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -27,6 +29,8 @@ import (
 
 	"github.com/google/ax/pkg/apis/v1alpha1"
 )
+
+var gitTimeout = 10 * time.Minute // bounds each git attempt; a variable so tests can shorten it
 
 const (
 	// DefaultAXDir is the default directory inside the container used for AX system state and logs.
@@ -45,7 +49,6 @@ const (
 	gitErrorLog   = "git-error.log"
 	gitRetries    = 5
 	gitRetryDelay = 2 * time.Second
-	gitTimeout    = 10 * time.Minute
 
 	dirPerm  = 0o755
 	filePerm = 0o644
@@ -99,6 +102,9 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	for _, loc := range markerLocs(targetPath) {
 		// Every link on the way to the marker is refused, so a symlinked .ax or marker
 		// cannot send the check outside the workspace.
+		if err := dropLinkOnMarkerPath(loc); err != nil {
+			return nil, fmt.Errorf("clearing marker path %s: %w", loc.path, err)
+		}
 		if err := checkInsideWorkspace(loc.base, loc.path); err != nil {
 			return nil, fmt.Errorf("checking marker %s: %w", loc.path, err)
 		}
@@ -117,7 +123,7 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	if legacyErr != nil && !os.IsNotExist(legacyErr) {
 		return nil, fmt.Errorf("checking legacy marker %s: %w", legacy, legacyErr)
 	}
-	if legacyErr == nil {
+	if legacyErr == nil && legacyOwnedBy(legacy, ws) {
 		slog.Info("migrating legacy workspace marker", "path", targetPath)
 		recordMarker(targetPath, ws)
 		return res, nil
@@ -365,12 +371,100 @@ func fetchRepo(ctx context.Context, dir, repoURL, branch string, depth int32) ([
 	if err := run(fetchArgs...); err != nil {
 		return combined, err
 	}
+	// Files left by an earlier checkout that was interrupted hold exactly the repo's content,
+	// so they are removed and the checkout recreates them. Any other file is kept, and the
+	// checkout below refuses to overwrite it.
+	if err := removeIdenticalFiles(ctx, dir, "FETCH_HEAD"); err != nil {
+		return combined, err
+	}
 	// No -f: git refuses to overwrite a tracked file with local edits, or an untracked file
-	// that the checkout would replace. An inlined file that is not in the repo is left alone.
+	// that the checkout would replace.
 	if err := run("checkout", "FETCH_HEAD"); err != nil {
 		return combined, err
 	}
 	return combined, nil
+}
+
+// removeIdenticalFiles deletes the files in dir whose content matches the blob git would
+// check out for ref. Removing them loses nothing, because the checkout writes the same bytes.
+func removeIdenticalFiles(ctx context.Context, dir, ref string) error {
+	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-z", ref)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("git ls-tree %s: %w", ref, err)
+	}
+	// Each entry is "<mode> SP <type> SP <object> TAB <path>", NUL-terminated.
+	for _, entry := range strings.Split(string(out), "\x00") {
+		meta, path, ok := strings.Cut(entry, "\t")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(meta)
+		if len(fields) != 3 || fields[1] != "blob" || fields[0] == "120000" {
+			continue
+		}
+		p := filepath.Join(dir, filepath.FromSlash(path))
+		if checkInsideWorkspace(dir, p) != nil {
+			continue
+		}
+		info, err := os.Lstat(p)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		// A git blob id is the SHA-1 of "blob <size>\0" followed by the content.
+		sum := sha1.Sum(append([]byte(fmt.Sprintf("blob %d\x00", len(data))), data...))
+		if hex.EncodeToString(sum[:]) == fields[2] {
+			if err := os.Remove(p); err != nil {
+				return fmt.Errorf("removing %s: %w", p, err)
+			}
+		}
+	}
+	return nil
+}
+
+// dropLinkOnMarkerPath removes the first symbolic link found between a marker's base and
+// the marker path. The agent can create such a link inside the workspace, and leaving it
+// would make every boot fail. The link itself is removed, never its target.
+func dropLinkOnMarkerPath(loc markerLoc) error {
+	rel, err := filepath.Rel(loc.base, loc.path)
+	if err != nil {
+		return err
+	}
+	current := loc.base
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			slog.Warn("removing symbolic link on the marker path", "path", current)
+			return os.Remove(current)
+		}
+	}
+	return nil
+}
+
+// legacyOwnedBy reports whether the legacy marker at path was written for this workspace.
+// Two paths can share a legacy name (/a/b and /a-b), so the recorded name is checked too.
+func legacyOwnedBy(path string, ws *v1alpha1.Workspace) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	name := ws.GetMetadata().GetName()
+	if name == "" {
+		name = "unknown" // the name the old writer used when the workspace had none
+	}
+	return strings.HasPrefix(string(data), "workspace: "+name+"\n")
 }
 
 // writeFileAtomic writes data to a temporary file beside path, then renames it into place,

@@ -433,7 +433,7 @@ func TestSetupWorkspace_HonorsLegacyMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacy := "initialized-" + strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(strings.Trim(filepath.Clean(tempDir), "/"))
-	if err := os.WriteFile(filepath.Join(stateDir, legacy), []byte("old"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, legacy), []byte("workspace: legacy-ws\ninitialized_at: 2026-01-01T00:00:00Z\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -851,11 +851,14 @@ func TestSetupWorkspace_RefusesDanglingMarkerLink(t *testing.T) {
 	defer func() { workspace.AXDir = origAXDir }()
 
 	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "dangling-ws"}}
-	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err == nil {
-		t.Errorf("expected a symbolic link at the marker path to be refused")
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
 	}
 	if _, err := os.Stat(outside); !os.IsNotExist(err) {
 		t.Errorf("marker was written through a dangling symbolic link")
+	}
+	if info, err := os.Lstat(filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); err != nil || !info.Mode().IsRegular() {
+		t.Errorf("marker should be a regular file inside the workspace: %v", err)
 	}
 }
 
@@ -912,11 +915,14 @@ func TestSetupWorkspace_RefusesSymlinkedMarkerDir(t *testing.T) {
 	defer func() { workspace.AXDir = origAXDir }()
 
 	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "marker-dir-link-ws"}}
-	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err == nil {
-		t.Errorf("expected a symlinked .ax directory to be refused")
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
 	}
 	if data, _ := os.ReadFile(marker); string(data) != "planted" {
 		t.Errorf("marker outside the workspace was modified")
+	}
+	if info, err := os.Lstat(filepath.Join(target, ".ax")); err != nil || !info.IsDir() {
+		t.Errorf(".ax should be a real directory after setup: %v", err)
 	}
 }
 
@@ -1029,5 +1035,249 @@ func TestSetupWorkspace_InlineFileBeforeRootClone(t *testing.T) {
 		if _, err2 := os.Stat(filepath.Join(target, ".git", ".ax", workspace.InitializedMarkerFilename)); err2 != nil {
 			t.Errorf("marker missing after a successful clone")
 		}
+	}
+}
+
+// initSourceRepo makes a git repo at dir with one committed file, README.md = content.
+func initSourceRepo(t *testing.T, dir, content string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", "git init -q && git symbolic-ref HEAD refs/heads/main && git config user.email t@ax.io && git config user.name AX && git add . && git commit -qm init")
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+}
+
+// TestSetupWorkspace_ResumesInterruptedCheckout checks that files left by an interrupted
+// checkout, identical to the repo, do not block the clone on the next run.
+func TestSetupWorkspace_ResumesInterruptedCheckout(t *testing.T) {
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	initSourceRepo(t, src, "hi\n")
+
+	target := filepath.Join(tempDir, "ws")
+	dest := filepath.Join(target, "code")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", "git init -q && git remote add origin "+src)
+	cmd.Dir = dest
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "README.md"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-resume")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "resume-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "code", Repo: src, Dir: "code"}}},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if len(res.ClonedRepos) != 1 {
+		t.Errorf("repo not cloned after an interrupted checkout: %v", res.ClonedRepos)
+	}
+	if _, err := os.Stat(filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		t.Errorf("marker missing after resuming the checkout: %v", err)
+	}
+}
+
+// TestSetupWorkspace_KeepsEditedFileInRepoDir checks that a file in the repo's directory
+// whose content differs from the repo is kept, and the checkout does not overwrite it.
+func TestSetupWorkspace_KeepsEditedFileInRepoDir(t *testing.T) {
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	initSourceRepo(t, src, "repo\n")
+
+	target := filepath.Join(tempDir, "ws")
+	dest := filepath.Join(target, "code")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "README.md"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-edit")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "edit-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "code", Repo: src, Dir: "code"}}},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	data, _ := os.ReadFile(filepath.Join(dest, "README.md"))
+	if string(data) != "agent edit\n" {
+		t.Errorf("agent edit overwritten: %q", data)
+	}
+}
+
+// TestSetupWorkspace_RefusesOptionLikeRepoValues checks that a branch or repo starting with
+// "-" is never passed to git as an option, so a branch cannot run a command.
+func TestSetupWorkspace_RefusesOptionLikeRepoValues(t *testing.T) {
+	tempDir := t.TempDir()
+	pwn := filepath.Join(tempDir, "pwn")
+
+	target := filepath.Join(tempDir, "ws")
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-opt")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "opt-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{
+			{Name: "branch", Repo: "https://example.invalid/r.git", Dir: "a", Branch: "--upload-pack=touch " + pwn},
+			{Name: "repo", Repo: "--upload-pack=touch " + pwn, Dir: "b"},
+		}},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if len(res.ClonedRepos) != 0 {
+		t.Errorf("option-like repo was cloned: %v", res.ClonedRepos)
+	}
+	if _, err := os.Stat(pwn); !os.IsNotExist(err) {
+		t.Errorf("option value ran a command")
+	}
+}
+
+// TestSetupWorkspace_GitAttemptTimeout checks that a git attempt past its deadline fails,
+// so a stalled remote cannot block setup.
+func TestSetupWorkspace_GitAttemptTimeout(t *testing.T) {
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	initSourceRepo(t, src, "hi\n")
+
+	defer workspace.SetGitTimeoutForTest(time.Nanosecond)()
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-timeout")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "timeout-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "r", Repo: src, Dir: "code"}}},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, filepath.Join(tempDir, "ws"))
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if len(res.ClonedRepos) != 0 {
+		t.Errorf("clone succeeded past its deadline: %v", res.ClonedRepos)
+	}
+}
+
+// TestSetupWorkspace_RefusesAbsoluteDotDotPath checks that an absolute inlined path with ".."
+// is refused, so a symbolic link on the way cannot redirect the write.
+func TestSetupWorkspace_RefusesAbsoluteDotDotPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir := t.TempDir()
+	outside := filepath.Join(tempDir, "outside")
+	if err := os.MkdirAll(filepath.Join(outside, "deep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tempDir, "ws")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "deep"), filepath.Join(target, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-dotdot")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "dotdot-ws"},
+		Spec: &v1alpha1.WorkspaceSpec{
+			Files: []*v1alpha1.File{{Path: target + "/link/../evil.txt", Content: "bad"}},
+		},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "evil.txt")); !os.IsNotExist(err) {
+		t.Errorf("file written outside the workspace through a parent reference")
+	}
+}
+
+// TestSetupWorkspace_AgentSymlinkOnMarkerPath checks that a symbolic link the workspace holds
+// at .ax is removed, so the marker is recorded and the next boot is not blocked.
+func TestSetupWorkspace_AgentSymlinkOnMarkerPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir := t.TempDir()
+	target := filepath.Join(tempDir, "ws")
+	if err := os.MkdirAll(filepath.Join(target, "elsewhere"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(target, "elsewhere"), filepath.Join(target, ".ax")); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-agent-link")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "agent-link-ws"}}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if info, err := os.Lstat(filepath.Join(target, ".ax")); err != nil || !info.IsDir() {
+		t.Errorf(".ax should be a real directory after setup: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		t.Errorf("marker missing: %v", err)
+	}
+}
+
+// TestSetupWorkspace_IgnoresLegacyMarkerOfOtherWorkspace checks that a legacy marker written
+// for a different workspace does not suppress this workspace's setup.
+func TestSetupWorkspace_IgnoresLegacyMarkerOfOtherWorkspace(t *testing.T) {
+	tempDir := t.TempDir()
+	target := filepath.Join(tempDir, "ws")
+	axDir := filepath.Join(tempDir, "ax-state-legacy")
+	if err := os.MkdirAll(axDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(axDir, workspace.LegacyMarkerNameForTest(target))
+	if err := os.WriteFile(legacy, []byte("workspace: other-ws\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = axDir
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "this-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Files: []*v1alpha1.File{{Path: "x.txt", Content: "x"}}},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "x.txt")); err != nil {
+		t.Errorf("setup was skipped because of another workspace's legacy marker: %v", err)
 	}
 }
