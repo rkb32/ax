@@ -268,7 +268,7 @@ func cloneRepos(ctx context.Context, repos []*v1alpha1.GitRepo, targetPath strin
 		}
 		// A retry after another repo failed must not run checkout -f over a repo that
 		// already has its contents, because that discards the agent's uncommitted edits.
-		if has, matches := existingCheckout(ctx, dest, repo.Repo); has {
+		if has, matches := existingCheckoutBounded(ctx, dest, repo.Repo); has {
 			// A checkout of another repository is never counted as this one, and it is
 			// not overwritten either.
 			if !matches {
@@ -725,4 +725,12 @@ func existingCheckout(ctx context.Context, dir, repoURL string) (has, matches bo
 		return true, false
 	}
 	return true, strings.TrimSpace(string(out)) == repoURL
+}
+
+// existingCheckoutBounded runs existingCheckout under the per-attempt git timeout, so a
+// blocked config read cannot hold up setup.
+func existingCheckoutBounded(ctx context.Context, dir, repoURL string) (has, matches bool) {
+	ctx, cancel := context.WithTimeout(ctx, gitTimeout)
+	defer cancel()
+	return existingCheckout(ctx, dir, repoURL)
 }
