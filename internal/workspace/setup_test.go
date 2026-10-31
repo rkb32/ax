@@ -1470,3 +1470,51 @@ func TestSetupWorkspace_KeepsExecBitEdit(t *testing.T) {
 		t.Errorf("repo counted as cloned over a locally edited file: %v", res.ClonedRepos)
 	}
 }
+
+// TestSetupWorkspace_ResumesCRLFCheckout checks that a file left by an interrupted checkout is
+// recognised when the repo converts line endings: its CRLF bytes are the checkout output.
+func TestSetupWorkspace_ResumesCRLFCheckout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell to build the repos")
+	}
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mk := exec.Command("sh", "-c", "git init -q && git symbolic-ref HEAD refs/heads/main && git config user.email t@ax.io && git config user.name AX && printf 'hi\n' > README.md && printf 'README.md text eol=crlf\n' > .gitattributes && git add . && git commit -qm init")
+	mk.Dir = src
+	if out, err := mk.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v (%s)", err, out)
+	}
+
+	target := filepath.Join(tempDir, "ws")
+	dest := filepath.Join(target, "code")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initCmd := exec.Command("sh", "-c", "git init -q && git remote add origin "+src)
+	initCmd.Dir = dest
+	if out, err := initCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init dest: %v (%s)", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "README.md"), []byte("hi\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-crlf")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "crlf-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "code", Repo: src, Dir: "code"}}},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if len(res.ClonedRepos) != 1 {
+		t.Errorf("CRLF checkout left by an interrupted run was not resumed: %v", res.ClonedRepos)
+	}
+}

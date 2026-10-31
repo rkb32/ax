@@ -16,8 +16,6 @@ package workspace
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -417,13 +415,15 @@ func removeIdenticalFiles(ctx context.Context, dir, ref string) error {
 		if (info.Mode().Perm()&0o111 != 0) != (fields[0] == "100755") {
 			continue
 		}
-		data, err := os.ReadFile(p)
+		// Hash the file the way checkout would write it, so conversion filters such as CRLF
+		// are applied. Attributes come from the fetched tree, which is not checked out yet.
+		hashCmd := exec.CommandContext(ctx, "git", "--attr-source="+ref, "hash-object", "--path="+path, "--", p)
+		hashCmd.Dir = dir
+		out, err := hashCmd.Output()
 		if err != nil {
 			continue
 		}
-		// A git blob id is the SHA-1 of "blob <size>\0" followed by the content.
-		sum := sha1.Sum(append([]byte(fmt.Sprintf("blob %d\x00", len(data))), data...))
-		if hex.EncodeToString(sum[:]) == fields[2] {
+		if strings.TrimSpace(string(out)) == fields[2] {
 			if err := os.Remove(p); err != nil {
 				return fmt.Errorf("removing %s: %w", p, err)
 			}
