@@ -858,3 +858,28 @@ func TestSetupWorkspace_RefusesDanglingMarkerLink(t *testing.T) {
 		t.Errorf("marker was written through a dangling symbolic link")
 	}
 }
+
+// TestSetupWorkspace_DirectoryCollisionNotMarked checks that a declared file whose path is
+// already a directory leaves setup incomplete, so no maiden-run marker is written.
+func TestSetupWorkspace_DirectoryCollisionNotMarked(t *testing.T) {
+	tempDir := t.TempDir()
+	target := filepath.Join(tempDir, "ws")
+	if err := os.MkdirAll(filepath.Join(target, "config.yaml"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-dir")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "dir-collision-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Files: []*v1alpha1.File{{Path: "config.yaml", Content: "x"}}},
+	}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); !os.IsNotExist(err) {
+		t.Errorf("marker written although a declared file was not created")
+	}
+}

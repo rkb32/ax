@@ -477,7 +477,13 @@ func writeFiles(files []*v1alpha1.File, targetPath string) bool {
 			ok = false
 			continue
 		}
-		if _, err := os.Lstat(dest); err == nil {
+		if info, err := os.Lstat(dest); err == nil {
+			// A directory where the file should be is not a completed file setup.
+			if info.IsDir() {
+				slog.Warn("workspace file path is a directory", "path", f.GetPath())
+				ok = false
+				continue
+			}
 			slog.Info("keeping existing workspace file", "path", dest)
 			continue
 		}
