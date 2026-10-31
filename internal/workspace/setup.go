@@ -164,15 +164,26 @@ func gitDirOf(targetPath string) string {
 	if !filepath.IsAbs(dir) {
 		dir = filepath.Join(targetPath, dir)
 	}
+	// Resolve symlinks before the containment check. A lexically inside path can pass
+	// through a link to a directory outside the workspace, and the marker would then be
+	// lost on a volumes-only resume.
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return ""
+	}
+	root, err := filepath.EvalSymlinks(targetPath)
+	if err != nil {
+		return ""
+	}
 	// A Git directory outside the workspace is not on the durable volume, so the marker
 	// would be lost on a volumes-only resume. Fall back to .ax in the workspace.
-	if rel, err := filepath.Rel(targetPath, dir); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if rel, err := filepath.Rel(root, resolved); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return ""
 	}
-	if target, err := os.Stat(dir); err != nil || !target.IsDir() {
+	if target, err := os.Stat(resolved); err != nil || !target.IsDir() {
 		return ""
 	}
-	return dir
+	return resolved
 }
 
 // markerCandidates lists where a maiden-run marker may already exist for a workspace.

@@ -780,3 +780,47 @@ func TestSetupWorkspace_RefusesSymlinkedRoot(t *testing.T) {
 		t.Errorf("expected a symlinked workspace root to be refused")
 	}
 }
+
+// TestSetupWorkspace_MarkerNotThroughOutsideGitDirLink checks that a .git file whose gitdir
+// is lexically inside the workspace but is a symbolic link to a directory outside it does
+// not send the marker outside the workspace volume.
+func TestSetupWorkspace_MarkerNotThroughOutsideGitDirLink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir, err := os.MkdirTemp("", "ax-ws-gitdir-link-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	outsideGit := filepath.Join(tempDir, "outside", "gitdir")
+	if err := os.MkdirAll(outsideGit, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tempDir, "ws")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideGit, filepath.Join(target, "link-git")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, ".git"), []byte("gitdir: link-git\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-gitdir")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "gitdir-link-ws"}}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outsideGit, ".ax", workspace.InitializedMarkerFilename)); !os.IsNotExist(err) {
+		t.Errorf("marker was written outside the workspace through a symbolic link")
+	}
+	if _, err := os.Stat(filepath.Join(target, ".ax", workspace.InitializedMarkerFilename)); err != nil {
+		t.Errorf("marker missing from the workspace fallback: %v", err)
+	}
+}
