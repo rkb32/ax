@@ -1331,3 +1331,39 @@ func TestSetupWorkspace_StalledFetchIsCutOff(t *testing.T) {
 		t.Errorf("stalled repo counted as cloned: %v", res.ClonedRepos)
 	}
 }
+
+// TestSetupWorkspace_KeepsMatchingCheckout checks that a checkout whose origin is the declared
+// repo is counted as cloned and left as is, including local edits to tracked files.
+func TestSetupWorkspace_KeepsMatchingCheckout(t *testing.T) {
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	initSourceRepo(t, src, "repo\n")
+
+	target := filepath.Join(tempDir, "ws")
+	dest := filepath.Join(target, "code")
+	if out, err := exec.Command("git", "clone", "-q", src, dest).CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v (%s)", err, out)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "README.md"), []byte("local edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-matching")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "matching-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "code", Repo: src, Dir: "code"}}},
+	}
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	if len(res.ClonedRepos) != 1 {
+		t.Errorf("matching checkout not counted as cloned: %v", res.ClonedRepos)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dest, "README.md")); string(data) != "local edit\n" {
+		t.Errorf("local edit to a matching checkout was overwritten: %q", data)
+	}
+}
