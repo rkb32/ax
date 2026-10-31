@@ -1119,12 +1119,16 @@ func TestSetupWorkspace_KeepsEditedFileInRepoDir(t *testing.T) {
 		Metadata: &v1alpha1.ObjectMeta{Name: "edit-ws"},
 		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "code", Repo: src, Dir: "code"}}},
 	}
-	if _, err := workspace.SetupWorkspace(context.Background(), ws, target); err != nil {
+	res, err := workspace.SetupWorkspace(context.Background(), ws, target)
+	if err != nil {
 		t.Fatalf("setup failed: %v", err)
 	}
 	data, _ := os.ReadFile(filepath.Join(dest, "README.md"))
 	if string(data) != "agent edit\n" {
 		t.Errorf("agent edit overwritten: %q", data)
+	}
+	if len(res.ClonedRepos) != 0 {
+		t.Errorf("repo with an edited file counted as cloned: %v", res.ClonedRepos)
 	}
 }
 
@@ -1279,5 +1283,51 @@ func TestSetupWorkspace_IgnoresLegacyMarkerOfOtherWorkspace(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(target, "x.txt")); err != nil {
 		t.Errorf("setup was skipped because of another workspace's legacy marker: %v", err)
+	}
+}
+
+// TestSetupWorkspace_StalledFetchIsCutOff checks that a fetch that never finishes is stopped
+// by the per-attempt timeout, so setup returns instead of blocking the task forever.
+func TestSetupWorkspace_StalledFetchIsCutOff(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script as a stand-in for git")
+	}
+	tempDir := t.TempDir()
+	src := filepath.Join(tempDir, "src")
+	initSourceRepo(t, src, "hi\n")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A git stand-in that stalls on fetch. exec replaces the shell, so the timeout kills the
+	// process that holds the output pipe.
+	fakeDir := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = fetch ]; then exec sleep 30; fi\nexec " + realGit + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(fakeDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	defer workspace.SetGitTimeoutForTest(200 * time.Millisecond)()
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-stall")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{
+		Metadata: &v1alpha1.ObjectMeta{Name: "stall-ws"},
+		Spec:     &v1alpha1.WorkspaceSpec{Git: []*v1alpha1.GitRepo{{Name: "r", Repo: src, Dir: "code"}}},
+	}
+	start := time.Now()
+	res, err := workspace.SetupWorkspace(context.Background(), ws, filepath.Join(tempDir, "ws"))
+	if err != nil {
+		t.Fatalf("setup failed: %v", err)
+	}
+	// Without the timeout each attempt would wait 30s, so the bound below separates the two.
+	if elapsed := time.Since(start); elapsed > 20*time.Second {
+		t.Errorf("setup took %v; a stalled fetch was not cut off", elapsed)
+	}
+	if len(res.ClonedRepos) != 0 {
+		t.Errorf("stalled repo counted as cloned: %v", res.ClonedRepos)
 	}
 }
