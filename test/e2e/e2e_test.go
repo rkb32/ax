@@ -404,7 +404,7 @@ spec:
 // TestE2E_WorkspaceSetup_FilesAndGit verifies workspace setup for a task:
 // custom mount path (/workspace/primary), working directory set to the mount
 // path, spec.git checkout at a tag, overlay spec.files, spec.skills.path, and
-// the /ax/initialized-* maiden-run marker.
+// the .ax/initialized maiden-run marker in the workspace.
 func TestE2E_WorkspaceSetup_FilesAndGit(t *testing.T) {
 	ns := defaultAtespace
 	wsGit := uniqueName("ws-git")

@@ -58,18 +58,15 @@ func TestSetupWorkspace_MaidenRun(t *testing.T) {
 		t.Errorf("expected maiden run to be true")
 	}
 
-	// Verify marker file exists under stateDir/initialized
-	markerFile := filepath.Join(stateDir, workspace.MarkerName(tempDir))
+	// Verify marker file exists under the workspace .ax directory
+	markerFile := filepath.Join(tempDir, ".ax", workspace.InitializedMarkerFilename)
 	if _, err := os.Stat(markerFile); os.IsNotExist(err) {
 		t.Errorf("expected marker file %s to exist", markerFile)
 	}
 
-	// Verify workspace directory has no .ax-initialized or .ax directory
+	// The old marker name must not be written into the workspace.
 	if _, err := os.Stat(filepath.Join(tempDir, ".ax-initialized")); !os.IsNotExist(err) {
 		t.Errorf("expected .ax-initialized not to be in workspace")
-	}
-	if _, err := os.Stat(filepath.Join(tempDir, ".ax")); !os.IsNotExist(err) {
-		t.Errorf("expected .ax directory not to be in workspace")
 	}
 
 	// 2. Second run (should detect already initialized)
@@ -193,7 +190,7 @@ func TestSetupWorkspace_GitError(t *testing.T) {
 	}
 
 	// Verify initialization marker was not created due to failure
-	markerFile := filepath.Join(stateDir, workspace.MarkerName(tempDir))
+	markerFile := filepath.Join(tempDir, ".ax", workspace.InitializedMarkerFilename)
 	if _, err := os.Stat(markerFile); !os.IsNotExist(err) {
 		t.Errorf("expected marker file %s NOT to exist after failure", markerFile)
 	}

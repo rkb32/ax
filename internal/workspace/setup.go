@@ -33,6 +33,8 @@ const (
 	DefaultAXDir = "/ax"
 	// InitializedMarkerFilename is the base name of the marker file written after a successful maiden run.
 	InitializedMarkerFilename = "initialized"
+	// markerDirName is the directory under the workspace that holds the marker.
+	markerDirName = ".ax"
 
 	defaultWorkspacePath = "/workspace"
 	defaultBranch        = "main"
@@ -60,8 +62,8 @@ type SetupResult struct {
 }
 
 // SetupWorkspace prepares the workspace directory on its maiden run: it clones the
-// declared Git repositories and creates the skills path. A marker file under AXDir
-// records a completed maiden run so subsequent calls are no-ops.
+// declared Git repositories and creates the skills path. A marker file under the workspace
+// (see workspaceMarkerPath) records a completed maiden run so subsequent calls are no-ops.
 //
 // Git failures are logged and recorded under AXDir but do not abort setup. The marker
 // is withheld in that case so the next start retries the clone.
@@ -82,9 +84,16 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 		slog.Warn("creating ax state directory", "dir", AXDir, "error", err)
 	}
 
-	markerPath := filepath.Join(AXDir, MarkerName(targetPath))
+	markerPath := workspaceMarkerPath(targetPath)
 	if _, err := os.Stat(markerPath); err == nil {
 		slog.Info("workspace already initialized; skipping maiden run setup", "path", targetPath)
+		return res, nil
+	}
+	// A marker from before the workspace-volume change lives under AXDir. Migrate it, so a
+	// container that still has AXDir does not rerun setup over the agent's edits.
+	if _, err := os.Stat(filepath.Join(AXDir, MarkerName(targetPath))); err == nil {
+		slog.Info("migrating legacy workspace marker", "path", targetPath)
+		writeMarker(markerPath, ws)
 		return res, nil
 	}
 
@@ -264,6 +273,16 @@ func MarkerName(path string) string {
 	return InitializedMarkerFilename + "-" + strings.ReplaceAll(clean, "/", "-")
 }
 
+// workspaceMarkerPath returns where the maiden-run marker lives: on the workspace volume, so
+// it survives a volumes-only resume. For a Git repo it sits in the Git directory, which
+// `git add -A` and `git clean -fdx` never touch. Otherwise it sits in .ax.
+func workspaceMarkerPath(targetPath string) string {
+	if info, err := os.Lstat(filepath.Join(targetPath, ".git")); err == nil && info.IsDir() {
+		return filepath.Join(targetPath, ".git", markerDirName, InitializedMarkerFilename)
+	}
+	return filepath.Join(targetPath, markerDirName, InitializedMarkerFilename)
+}
+
 // writeMarker records a completed maiden run.
 func writeMarker(path string, ws *v1alpha1.Workspace) {
 	name := "unknown"
@@ -271,6 +290,10 @@ func writeMarker(path string, ws *v1alpha1.Workspace) {
 		name = ws.GetMetadata().GetName()
 	}
 	content := fmt.Sprintf("workspace: %s\ninitialized_at: %s\n", name, time.Now().UTC().Format(time.RFC3339))
+	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
+		slog.Warn("failed to create initialized marker directory", "path", path, "error", err)
+		return
+	}
 	if err := os.WriteFile(path, []byte(content), filePerm); err != nil {
 		slog.Warn("failed to write initialized marker file", "path", path, "error", err)
 	}
