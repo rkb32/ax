@@ -78,10 +78,16 @@ func SetupWorkspace(ctx context.Context, ws *v1alpha1.Workspace, targetPath stri
 	}
 	res := &SetupResult{WorkspacePath: targetPath}
 
+	// Check the parents before MkdirAll, which would create directories through a link.
+	// A parent inside a volume the agent can write could be turned into a link to somewhere
+	// off the volume, so every existing parent is checked. Mount points must be given by
+	// their real path.
+	if err := refuseSymlinkAncestors(targetPath); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(targetPath, dirPerm); err != nil {
 		return nil, fmt.Errorf("creating workspace directory %s: %w", targetPath, err)
 	}
-	// Only the workspace folder itself is checked. Its parents may be mount symlinks.
 	if err := refuseSymlink(targetPath); err != nil {
 		return nil, err
 	}
@@ -426,6 +432,18 @@ func writeMarker(loc markerLoc, ws *v1alpha1.Workspace) error {
 		return fmt.Errorf("writing marker file %s: %w", path, err)
 	}
 	return nil
+}
+
+// refuseSymlinkAncestors fails when any existing parent of dir is a symbolic link.
+func refuseSymlinkAncestors(dir string) error {
+	for parent := filepath.Dir(dir); ; parent = filepath.Dir(parent) {
+		if err := refuseSymlink(parent); err != nil {
+			return err
+		}
+		if filepath.Dir(parent) == parent {
+			return nil
+		}
+	}
 }
 
 // refuseSymlink fails when dir exists and is a symbolic link, so a committed .ax link

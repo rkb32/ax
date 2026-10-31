@@ -961,3 +961,33 @@ func TestSetupWorkspace_ForeignCheckoutNotCounted(t *testing.T) {
 		t.Errorf("foreign checkout's origin changed to %q", got)
 	}
 }
+
+// TestSetupWorkspace_RefusesSymlinkedAncestor checks that a workspace whose parent directory
+// is a symbolic link is refused, even when the workspace folder itself is a real directory.
+func TestSetupWorkspace_RefusesSymlinkedAncestor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("creating symbolic links needs extra privileges on Windows")
+	}
+	tempDir := t.TempDir()
+	real := filepath.Join(tempDir, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(tempDir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(link, "ws")
+
+	origAXDir := workspace.AXDir
+	workspace.AXDir = filepath.Join(tempDir, "ax-state-ancestor")
+	defer func() { workspace.AXDir = origAXDir }()
+
+	ws := &v1alpha1.Workspace{Metadata: &v1alpha1.ObjectMeta{Name: "ancestor-link-ws"}}
+	if _, err := workspace.SetupWorkspace(context.Background(), ws, root); err == nil {
+		t.Errorf("expected a workspace under a symlinked parent to be refused")
+	}
+	if _, err := os.Stat(filepath.Join(real, "ws")); !os.IsNotExist(err) {
+		t.Errorf("workspace was created through a symbolic link parent")
+	}
+}
